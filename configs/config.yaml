@@ -1,0 +1,104 @@
+# BaFuse Configuration File
+
+# Data Paths
+data:
+  raw_dir: "data/raw"
+  processed_dir: "data/processed"
+  
+# Data Processing
+processing:
+  time_tolerance_hours: 24  # Pairing tolerance for discharge-EIS matching
+  train_ratio: 0.6
+  val_ratio: 0.2
+  test_ratio: 0.2
+  random_state: 42
+  stratify_by_soh: true
+
+# Model Architecture
+model:
+  discharge_input_size: 5  # [voltage, current, capacity, temperature, time]
+  eis_num_frequencies: 67  # Number of frequency points in EIS
+  physics_num_features: 10  # Degradation trajectory features
+  latent_dim: 64
+  fusion_method: "cross_attention"  # or "weighted", "concat"
+  fusion_dim: 128
+
+# Encoders
+encoders:
+  discharge:
+    type: "lstm"  # or "cnn", "transformer"
+    hidden_size: 128
+    num_layers: 2
+    dropout: 0.2
+  
+  eis:
+    type: "cnn"  # 1D convolution on frequency spectrum
+    hidden_size: 128
+    dropout: 0.2
+  
+  physics:
+    type: "mlp"
+    hidden_sizes: [256, 128]
+    dropout: 0.2
+
+# Fusion
+fusion:
+  cross_attention:
+    num_heads: 4
+    dropout: 0.1
+
+# Loss Functions
+loss:
+  base_loss: "mse"  # or "mae"
+  lambda_physics: 0.1  # Physics regularization weight
+  lambda_smooth: 0.05  # Smoothness weight
+  lambda_diversity: 0.01  # Modality diversity weight
+
+# Training
+training:
+  batch_size: 32
+  num_epochs: 100
+  learning_rate: 0.001
+  weight_decay: 1e-5
+  optimizer: "adam"  # or "sgd", "adamw"
+  
+  # Learning rate schedule
+  scheduler:
+    type: "cosine"  # or "step", "exponential"
+    warmup_epochs: 5
+  
+  # Early stopping
+  early_stopping:
+    enabled: true
+    patience: 15
+    min_delta: 0.001
+  
+  # Data loading
+  num_workers: 4
+  pin_memory: true
+  shuffle: true
+
+# Evaluation
+evaluation:
+  metrics: ["mae", "rmse", "r2", "mape"]
+  per_battery_analysis: true
+  uncertainty_quantification:
+    enabled: true
+    mc_samples: 30
+
+# Ablation Study
+ablation:
+  run: true
+  modalities: ["discharge", "eis", "physics"]
+  pairwise: true
+
+# Output
+output:
+  checkpoint_dir: "checkpoints"
+  results_dir: "results"
+  dashboard_port: 8501
+
+# Hardware
+device: "cuda"  # or "cpu"
+deterministic: true
+seed: 42
