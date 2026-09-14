@@ -16,9 +16,9 @@ processing:
 
 # Model Architecture
 model:
-  discharge_input_size: 5  # [voltage, current, capacity, temperature, time]
-  eis_num_frequencies: 67  # Number of frequency points in EIS
-  physics_num_features: 10  # Degradation trajectory features
+  discharge_input_size: 3  # [voltage_v, current_a, temperature_c] from time-series
+  eis_num_frequencies: 3   # [impedance, Re, Rct] scalar features
+  physics_num_features: 4  # [cycle_age_norm, capacity_fade, voltage_droop, impedance_rise]
   latent_dim: 64
   fusion_method: "cross_attention"  # or "weighted", "concat"
   fusion_dim: 128

@@ -27,6 +27,7 @@ wheels/
 data/raw/*.mat
 data/processed/*.pkl
 data/processed/*.csv
+data/
 
 # Checkpoints & Results
 checkpoints/
@@ -49,6 +50,10 @@ results/
 .DS_Store
 Thumbs.db
 
+# Virtual environment
+bafuse_env/
+
 # Logs
 logs/
 *.log
+training_log.txt

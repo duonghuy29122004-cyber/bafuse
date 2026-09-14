@@ -9,21 +9,18 @@ Fusion strategies:
 
 import torch
 import torch.nn as nn
-from typing import Tuple
+import torch.nn.functional as F
+from typing import Tuple, Dict
 
 
 class CrossAttentionFusion(nn.Module):
     """
     Cross-attention based fusion.
-    
-    Each modality attends to the others:
-    - Discharge curve as query → attends to EIS and physics
-    - EIS as query → attends to discharge and physics
-    - Physics as query → attends to discharge and EIS
-    
-    Then combine attended features for final SoH prediction.
+
+    Each modality attends to the other two, then the attended representations
+    are concatenated and projected to fusion_dim.
     """
-    
+
     def __init__(self, latent_dim: int = 64, num_heads: int = 4, fusion_dim: int = 128):
         """
         Args:
@@ -32,88 +29,121 @@ class CrossAttentionFusion(nn.Module):
             fusion_dim: Output fused dimension
         """
         super().__init__()
-        # TODO: Implement cross-attention mechanism
-        pass
-    
+        # Multi-head self-attention over the stacked 3 tokens
+        self.attn = nn.MultiheadAttention(
+            embed_dim=latent_dim,
+            num_heads=num_heads,
+            dropout=0.1,
+            batch_first=True,
+        )
+        self.norm = nn.LayerNorm(latent_dim)
+        # Project 3 * latent_dim → fusion_dim
+        self.proj = nn.Sequential(
+            nn.Linear(3 * latent_dim, fusion_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+        )
+
     def forward(
         self,
         discharge_latent: torch.Tensor,
         eis_latent: torch.Tensor,
-        physics_latent: torch.Tensor
-    ) -> Tuple[torch.Tensor, dict]:
+        physics_latent: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict]:
         """
         Args:
-            discharge_latent: (batch_size, latent_dim)
-            eis_latent: (batch_size, latent_dim)
-            physics_latent: (batch_size, latent_dim)
-        
+            discharge_latent: (B, latent_dim)
+            eis_latent:       (B, latent_dim)
+            physics_latent:   (B, latent_dim)
+
         Returns:
-            fused: (batch_size, fusion_dim)
-            attention_weights: dict of attention weight matrices for interpretability
+            fused:            (B, fusion_dim)
+            info:             dict with attention_weights
         """
-        # TODO: Implement forward pass with attention
-        pass
+        # Stack into sequence: (B, 3, latent_dim)
+        tokens = torch.stack([discharge_latent, eis_latent, physics_latent], dim=1)
+
+        # Self-attention across modalities
+        attended, attn_weights = self.attn(tokens, tokens, tokens)  # (B, 3, latent_dim)
+        attended = self.norm(attended + tokens)                      # residual
+
+        # Flatten and project
+        flat = attended.reshape(attended.size(0), -1)   # (B, 3*latent_dim)
+        fused = self.proj(flat)                          # (B, fusion_dim)
+
+        return fused, {"attention_weights": attn_weights}
 
 
 class WeightedFusion(nn.Module):
     """
     Learn scalar weights for each modality.
-    
-    Simple but interpretable: output = w_d * discharge + w_e * eis + w_p * physics
-    Weights are learnable and can be constrained to sum to 1.
+
+    output = w_d * discharge + w_e * eis + w_p * physics  (softmax-normalised)
+    Then project to fusion_dim.
     """
-    
+
     def __init__(self, latent_dim: int = 64, fusion_dim: int = 128):
-        """
-        Args:
-            latent_dim: Input latent dimension
-            fusion_dim: Output fused dimension
-        """
         super().__init__()
-        # TODO: Implement weighted fusion with learnable scalar weights
-        pass
-    
+        # Learnable raw logits; softmax gives normalised weights
+        self.raw_weights = nn.Parameter(torch.zeros(3))
+        self.proj = nn.Sequential(
+            nn.Linear(latent_dim, fusion_dim),
+            nn.ReLU(),
+        )
+
     def forward(
         self,
         discharge_latent: torch.Tensor,
         eis_latent: torch.Tensor,
-        physics_latent: torch.Tensor
-    ) -> Tuple[torch.Tensor, dict]:
+        physics_latent: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict]:
         """
         Returns:
-            fused: (batch_size, fusion_dim)
-            weights: dict with learned weights for each modality
+            fused: (B, fusion_dim)
+            info:  dict with per-modality weights
         """
-        # TODO: Implement forward pass
-        pass
+        w = F.softmax(self.raw_weights, dim=0)   # (3,)
+        combined = (
+            w[0] * discharge_latent
+            + w[1] * eis_latent
+            + w[2] * physics_latent
+        )  # (B, latent_dim)
+        fused = self.proj(combined)
+        return fused, {
+            "weights": {
+                "discharge": w[0].item(),
+                "eis": w[1].item(),
+                "physics": w[2].item(),
+            }
+        }
 
 
 class ConcatFusion(nn.Module):
     """
-    Simple concatenation + MLP fusion.
-    
-    Baseline: concatenate all latent vectors, pass through MLP.
+    Simple concatenation + MLP fusion (baseline).
     """
-    
+
     def __init__(self, latent_dim: int = 64, fusion_dim: int = 128):
-        """
-        Args:
-            latent_dim: Input latent dimension (same for all)
-            fusion_dim: Output fused dimension
-        """
         super().__init__()
-        # TODO: Implement concat + MLP fusion
-        pass
-    
+        self.mlp = nn.Sequential(
+            nn.Linear(3 * latent_dim, fusion_dim * 2),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(fusion_dim * 2, fusion_dim),
+            nn.ReLU(),
+        )
+
     def forward(
         self,
         discharge_latent: torch.Tensor,
         eis_latent: torch.Tensor,
-        physics_latent: torch.Tensor
-    ) -> torch.Tensor:
+        physics_latent: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict]:
         """
         Returns:
-            fused: (batch_size, fusion_dim)
+            fused: (B, fusion_dim)
+            info:  empty dict for API compatibility
         """
-        # TODO: Implement forward pass
-        pass
+        cat = torch.cat([discharge_latent, eis_latent, physics_latent], dim=-1)
+        fused = self.mlp(cat)
+        return fused, {}
