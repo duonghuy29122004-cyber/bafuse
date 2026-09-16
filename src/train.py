@@ -201,18 +201,25 @@ def train(
     else:
         optimizer = optim.SGD(model.parameters(), lr=lr, weight_decay=wd, momentum=0.9)
 
-    # ---- LR Scheduler ----
-    num_epochs = int(train_cfg.get("num_epochs", 100))
+    # ---- LR Scheduler: linear warmup then cosine ----
+    num_epochs    = int(train_cfg.get("num_epochs", 100))
     warmup_epochs = int(train_cfg.get("scheduler", {}).get("warmup_epochs", 5))
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=max(num_epochs - warmup_epochs, 1)
-    )
+
+    def _lr_lambda(epoch: int) -> float:
+        """Linear warmup for first warmup_epochs, then cosine decay."""
+        if epoch < warmup_epochs:
+            return float(epoch + 1) / float(warmup_epochs)
+        progress = (epoch - warmup_epochs) / max(num_epochs - warmup_epochs, 1)
+        return max(0.05, 0.5 * (1.0 + np.cos(np.pi * progress)))
+
+    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=_lr_lambda)
 
     # ---- Early stopping ----
     es_cfg = train_cfg.get("early_stopping", {})
     patience = int(es_cfg.get("patience", 15))
     min_delta = float(es_cfg.get("min_delta", 0.001))
     best_val_loss = float("inf")
+    best_val_mae  = float("inf")   # P4: track MAE — more stable than loss on small val set
     patience_counter = 0
 
     # ---- Checkpoint dir ----
@@ -234,9 +241,8 @@ def train(
         train_loss = train_epoch(model, train_loader, optimizer, criterion, torch_device)
         val_loss, val_metrics = validate(model, val_loader, criterion, torch_device)
 
-        # Step scheduler after warmup
-        if epoch > warmup_epochs:
-            scheduler.step()
+        # Step LR every epoch (lambda handles warmup+cosine)
+        scheduler.step()
 
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
@@ -248,12 +254,15 @@ def train(
             f"Epoch {epoch:3d}/{num_epochs}  "
             f"train_loss={train_loss:.4f}  val_loss={val_loss:.4f}  "
             f"MAE={val_metrics['mae']:.3f}  RMSE={val_metrics['rmse']:.3f}  "
-            f"R²={val_metrics['r2']:.4f}"
+            f"R²={val_metrics['r2']:.4f}  "
+            f"lr={scheduler.get_last_lr()[0]:.2e}"
         )
 
-        # Save best checkpoint
-        if val_loss < best_val_loss - min_delta:
+        # Save best checkpoint — use val MAE (more stable than loss on small val set)
+        current_mae = val_metrics["mae"]
+        if current_mae < best_val_mae - min_delta:
             best_val_loss = val_loss
+            best_val_mae  = current_mae
             patience_counter = 0
             ckpt_path = ckpt_dir / "best_model.pth"
             torch.save(
@@ -267,7 +276,7 @@ def train(
                 },
                 ckpt_path,
             )
-            logger.info(f"  ✓ Saved best checkpoint → {ckpt_path}")
+            logger.info(f"  ✓ Saved best checkpoint (MAE={current_mae:.3f}%) → {ckpt_path}")
         else:
             patience_counter += 1
 

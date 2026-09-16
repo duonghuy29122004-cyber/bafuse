@@ -16,22 +16,16 @@ class DischargeEncoder(nn.Module):
     """
     Encode discharge curve dynamics into latent vector using LSTM.
 
-    Input: Time-series voltage/current/capacity/temperature
-    Output: Fixed-size latent representation
+    P4: hidden_size=256, num_layers=3 for more capacity.
+    Reverted latent_dim projection to single layer (dataset too small for deep MLP here).
     """
 
-    def __init__(self, input_size: int, hidden_size: int = 128, latent_dim: int = 64):
-        """
-        Args:
-            input_size: Number of discharge features (V, I, Cap, T, etc.)
-            hidden_size: LSTM hidden dimension
-            latent_dim: Output latent dimension
-        """
+    def __init__(self, input_size: int, hidden_size: int = 256, latent_dim: int = 64):
         super().__init__()
         self.lstm = nn.LSTM(
             input_size=input_size,
             hidden_size=hidden_size,
-            num_layers=2,
+            num_layers=3,
             batch_first=True,
             dropout=0.2,
             bidirectional=False,

@@ -4,10 +4,10 @@
 data:
   raw_dir: "data/raw"
   processed_dir: "data/processed"
-  
+
 # Data Processing
 processing:
-  time_tolerance_hours: 24  # Pairing tolerance for discharge-EIS matching
+  time_tolerance_hours: 24
   train_ratio: 0.6
   val_ratio: 0.2
   test_ratio: 0.2
@@ -16,26 +16,24 @@ processing:
 
 # Model Architecture
 model:
-  discharge_input_size: 3  # [voltage_v, current_a, temperature_c] from time-series
-  eis_num_frequencies: 3   # [impedance, Re, Rct] scalar features
-  physics_num_features: 4  # [cycle_age_norm, capacity_fade, voltage_droop, impedance_rise]
+  discharge_input_size: 3   # [voltage_v, current_a, temperature_c]
+  eis_num_frequencies: 3    # [impedance, Re, Rct]
+  physics_num_features: 4   # [cycle_age_norm, empirical_fade_prior, voltage_droop, impedance_rise]
   latent_dim: 64
-  fusion_method: "cross_attention"  # or "weighted", "concat"
+  fusion_method: "cross_attention"
   fusion_dim: 128
 
 # Encoders
 encoders:
   discharge:
-    type: "lstm"  # or "cnn", "transformer"
-    hidden_size: 128
-    num_layers: 2
+    type: "lstm"
+    hidden_size: 256        # P4: increased from 128
+    num_layers: 3           # P4: increased from 2
     dropout: 0.2
-  
   eis:
-    type: "cnn"  # 1D convolution on frequency spectrum
+    type: "mlp"
     hidden_size: 128
     dropout: 0.2
-  
   physics:
     type: "mlp"
     hidden_sizes: [256, 128]
@@ -49,31 +47,25 @@ fusion:
 
 # Loss Functions
 loss:
-  base_loss: "mse"  # or "mae"
-  lambda_physics: 0.1  # Physics regularization weight
-  lambda_smooth: 0.05  # Smoothness weight
-  lambda_diversity: 0.01  # Modality diversity weight
+  base_loss: "mse"
+  lambda_physics: 0.1
+  lambda_smooth: 0.05
+  lambda_diversity: 0.01
 
 # Training
 training:
   batch_size: 32
   num_epochs: 100
-  learning_rate: 0.001
+  learning_rate: 0.0005     # P4: reduced from 0.001
   weight_decay: 1e-5
-  optimizer: "adam"  # or "sgd", "adamw"
-  
-  # Learning rate schedule
+  optimizer: "adam"
   scheduler:
-    type: "cosine"  # or "step", "exponential"
-    warmup_epochs: 5
-  
-  # Early stopping
+    type: "cosine"
+    warmup_epochs: 10       # P4: increased from 5
   early_stopping:
     enabled: true
     patience: 15
     min_delta: 0.001
-  
-  # Data loading
   num_workers: 4
   pin_memory: true
   shuffle: true
@@ -99,6 +91,6 @@ output:
   dashboard_port: 8501
 
 # Hardware
-device: "cuda"  # or "cpu"
+device: "cuda"
 deterministic: true
 seed: 42
