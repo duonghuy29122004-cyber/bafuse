@@ -1,4 +1,4 @@
-"""
+﻿"""
 Validate data pipeline after bug fixes.
 Prints stats for: impedance, capacity, cycle_gap, sequence shape.
 """
@@ -96,3 +96,4 @@ print()
 print(SEP)
 print("ALL CHECKS PASSED -- pipeline is clean")
 print(SEP)
+

@@ -1,4 +1,4 @@
-"""
+﻿"""
 Evaluation of BaFuse model on test set.
 
 Computes:
@@ -74,8 +74,8 @@ def evaluate(model, test_loader: DataLoader, device: torch.device) -> Dict:
 
     overall = _compute_metrics(preds, targets)
     logger.info(
-        f"Test results — MAE={overall['mae']:.3f}  RMSE={overall['rmse']:.3f}  "
-        f"R²={overall['r2']:.4f}  MAPE={overall['mape']:.2f}%"
+        f"Test results: MAE={overall['mae']:.3f}  RMSE={overall['rmse']:.3f}  "
+        f"R^2={overall['r2']:.4f}  MAPE={overall['mape']:.2f}%"
     )
 
     # Per-battery breakdown
@@ -218,3 +218,4 @@ def compute_uncertainty(
         "targets": np.array(all_targets),
         "all_samples": mc_preds,
     }
+

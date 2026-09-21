@@ -1,14 +1,19 @@
-"""
+﻿"""
 Battery-group k-fold cross-validation for BaFuse.
 
-- Splits 34 batteries into k stratified groups by mean SoH
-- Each fold: train on k-1 groups, test on 1 group
-- Reports MAE/RMSE/R² per fold + mean±std
-- Also reports results with/without short-trajectory batteries (<20 cycles)
+Features:
+- Stratified 5-fold split by mean battery SoH
+- Each fold: train on k-1 groups, evaluate on 1 group
+- Reports MAE/RMSE/R² mean +/- std across folds
+- LSTM size comparison: hidden_size in [128, 192, 256] x num_layers in [2, 3]
+- Trajectory grouping: sufficient (>50 cycles) vs insufficient (<20 cycles)
+  reported separately so short-trajectory batteries don't skew overall metrics
 
 Usage:
-    python scripts/cross_validate.py              # 5-fold, 30 epochs
-    python scripts/cross_validate.py --folds 7 --epochs 50
+    python scripts/cross_validate.py                    # 5-fold, 30 epochs, all sizes
+    python scripts/cross_validate.py --epochs 50        # more epochs per fold
+    python scripts/cross_validate.py --hidden 128       # single size only
+    python scripts/cross_validate.py --no-size-compare  # skip LSTM comparison
 """
 
 import argparse
@@ -16,10 +21,12 @@ import json
 import logging
 import sys
 from pathlib import Path
+from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn as nn
 
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
@@ -32,42 +39,82 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-MIN_CYCLES_THRESHOLD = 20   # P1b: batteries with fewer cycles are "short-trajectory"
+# ── Battery trajectory thresholds ──────────────────────────────────────────
+SUFFICIENT_CYCLES   = 50   # >= this: "sufficient" trajectory
+INSUFFICIENT_CYCLES = 20   # <  this: "insufficient" -- too few to learn trend
+
+# ── LSTM configurations to compare ────────────────────────────────────────
+LSTM_CONFIGS = [
+    {"hidden_size": 128, "num_layers": 2, "label": "LSTM-128x2 (small)"},
+    {"hidden_size": 192, "num_layers": 2, "label": "LSTM-192x2 (medium)"},
+    {"hidden_size": 256, "num_layers": 3, "label": "LSTM-256x3 (large)"},
+]
 
 
-def _get_paired_df():
-    """Load or build paired DataFrame."""
-    cache = ROOT / "data" / "processed" / "paired.pkl"
-    if cache.exists():
-        logger.info(f"Loading cached paired data from {cache}")
-        return pd.read_pickle(cache)
+# ── Data loading ───────────────────────────────────────────────────────────
 
-    logger.info("Building paired data from scratch…")
+def _load_data() -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Load cached paired + discharge data, or build from scratch."""
+    paired_cache  = ROOT / "data" / "processed" / "paired.pkl"
+    dis_cache     = ROOT / "data" / "processed" / "discharge_raw.pkl"
+
+    if paired_cache.exists() and dis_cache.exists():
+        logger.info("Loading cached paired + discharge data")
+        return pd.read_pickle(paired_cache), pd.read_pickle(dis_cache)
+
+    logger.info("Building data from scratch (no cache found)")
     from src.data.parse_mat import parse_all_mat_files
     from src.data.pairing import pair_discharge_eis
+    (ROOT / "data" / "processed").mkdir(parents=True, exist_ok=True)
     discharge_df, eis_df = parse_all_mat_files("5. BatteryDataSet")
     paired_df = pair_discharge_eis(discharge_df, eis_df, max_cycle_gap=10)
-    cache.parent.mkdir(parents=True, exist_ok=True)
-    paired_df.to_pickle(cache)
-    return paired_df
+    discharge_df.to_pickle(dis_cache)
+    paired_df.to_pickle(paired_cache)
+    return paired_df, discharge_df
 
 
-def stratified_battery_kfold(paired_df: pd.DataFrame, k: int, seed: int = 42):
+def classify_batteries(paired_df: pd.DataFrame) -> Dict[str, List[str]]:
     """
-    Split batteries into k stratified folds by mean capacity.
+    Classify batteries into trajectory groups.
 
-    Returns list of (train_batteries, test_batteries) tuples.
+    Returns dict:
+        sufficient   : >= SUFFICIENT_CYCLES  pairs
+        intermediate : INSUFFICIENT_CYCLES <= n < SUFFICIENT_CYCLES
+        insufficient : < INSUFFICIENT_CYCLES pairs
     """
-    rng = np.random.default_rng(seed)
+    counts = paired_df.groupby("battery_id").size()
+    groups: Dict[str, List[str]] = {
+        "sufficient":    [],
+        "intermediate":  [],
+        "insufficient":  [],
+    }
+    for bid, n in counts.items():
+        if n >= SUFFICIENT_CYCLES:
+            groups["sufficient"].append(str(bid))
+        elif n < INSUFFICIENT_CYCLES:
+            groups["insufficient"].append(str(bid))
+        else:
+            groups["intermediate"].append(str(bid))
+    return groups
 
+
+# ── Fold splitting ─────────────────────────────────────────────────────────
+
+def stratified_battery_kfold(
+    paired_df: pd.DataFrame, k: int, seed: int = 42
+) -> List[Tuple[List[str], List[str]]]:
+    """
+    Stratified k-fold split at battery level by mean capacity.
+    Round-robin assignment ensures each fold has similar SoH distribution.
+    """
     battery_stats = (
         paired_df.groupby("battery_id")["capacity_ahr"]
         .mean()
         .reset_index()
         .rename(columns={"capacity_ahr": "mean_cap"})
+        .sort_values("mean_cap")
+        .reset_index(drop=True)
     )
-    # Sort by mean capacity then assign fold index round-robin (stratified)
-    battery_stats = battery_stats.sort_values("mean_cap").reset_index(drop=True)
     battery_stats["fold"] = battery_stats.index % k
 
     folds = []
@@ -78,14 +125,27 @@ def stratified_battery_kfold(paired_df: pd.DataFrame, k: int, seed: int = 42):
     return folds
 
 
+# ── Metrics ────────────────────────────────────────────────────────────────
+
 def _compute_metrics(preds: np.ndarray, targets: np.ndarray) -> dict:
+    if len(preds) == 0:
+        return {"mae": np.nan, "rmse": np.nan, "r2": np.nan, "n": 0}
     mae  = float(np.mean(np.abs(preds - targets)))
     rmse = float(np.sqrt(np.mean((preds - targets) ** 2)))
     ss_r = np.sum((targets - preds) ** 2)
     ss_t = np.sum((targets - targets.mean()) ** 2)
     r2   = float(1 - ss_r / (ss_t + 1e-8))
-    return {"mae": mae, "rmse": rmse, "r2": r2}
+    return {"mae": mae, "rmse": rmse, "r2": r2, "n": len(preds)}
 
+
+def _summarise(fold_metrics: List[dict], key: str = "mae") -> Tuple[float, float]:
+    vals = [m[key] for m in fold_metrics if not np.isnan(m.get(key, np.nan))]
+    if not vals:
+        return np.nan, np.nan
+    return float(np.mean(vals)), float(np.std(vals))
+
+
+# ── Train + eval one fold ──────────────────────────────────────────────────
 
 def train_and_eval_fold(
     train_df: pd.DataFrame,
@@ -93,40 +153,47 @@ def train_and_eval_fold(
     discharge_df: pd.DataFrame,
     epochs: int,
     device_str: str,
-) -> dict:
-    """Train one fold and return test metrics."""
-    from src.data.dataset import create_dataloaders, PHYSICS_NUM_FEATURES
+    lstm_hidden: int = 256,
+    lstm_layers: int = 3,
+) -> Tuple[dict, dict, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Train one fold and return:
+        (all_metrics, per_battery_metrics, preds, targets, battery_ids_array)
+    """
+    from src.data.dataset import create_dataloaders
     from src.models.bafuse import BaFuse
+    from src.models.encoders import DischargeEncoder
     from src.losses import SoHPredictionLoss
 
     device = torch.device(device_str)
 
-    # Use 15% of train as val (battery-level)
-    all_bats = train_df["battery_id"].unique()
+    # 15% of train batteries -> val
+    all_bats = list(train_df["battery_id"].unique())
     rng = np.random.default_rng(42)
     rng.shuffle(all_bats)
     n_val = max(1, int(len(all_bats) * 0.15))
     val_bats   = all_bats[:n_val]
     train_bats = all_bats[n_val:]
 
-    fold_train_df = train_df[train_df["battery_id"].isin(train_bats)].reset_index(drop=True)
-    fold_val_df   = train_df[train_df["battery_id"].isin(val_bats)].reset_index(drop=True)
+    fold_train = train_df[train_df["battery_id"].isin(train_bats)].reset_index(drop=True)
+    fold_val   = train_df[train_df["battery_id"].isin(val_bats)].reset_index(drop=True)
 
-    if fold_train_df.empty or fold_val_df.empty:
-        return {"mae": np.nan, "rmse": np.nan, "r2": np.nan}
+    empty = {"mae": np.nan, "rmse": np.nan, "r2": np.nan, "n": 0, "epoch_stopped": 0}
+    if fold_train.empty or fold_val.empty:
+        return empty, {}, np.array([]), np.array([]), np.array([])
 
     train_loader, val_loader, test_loader = create_dataloaders(
-        fold_train_df, fold_val_df, test_df,
+        fold_train, fold_val, test_df,
         discharge_data_df=discharge_df,
         batch_size=32, num_workers=0,
     )
 
-    # Detect actual physics dim from first batch
-    sample = next(iter(train_loader))
-    physics_dim = sample["physics"].shape[-1]
-    eis_dim     = sample["eis"].shape[-1]
+    sample      = next(iter(train_loader))
     dis_dim     = sample["discharge"].shape[-1]
+    eis_dim     = sample["eis"].shape[-1]
+    physics_dim = sample["physics"].shape[-1]
 
+    # Build model with specified LSTM size
     model = BaFuse(
         discharge_input_size=dis_dim,
         eis_num_frequencies=eis_dim,
@@ -136,185 +203,293 @@ def train_and_eval_fold(
         fusion_dim=128,
     ).to(device)
 
+    # Override discharge encoder with the specified LSTM size
+    model.discharge_encoder = DischargeEncoder(
+        input_size=dis_dim,
+        hidden_size=lstm_hidden,
+        latent_dim=64,
+    ).to(device)
+
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
     criterion = SoHPredictionLoss(base_loss="mse", lambda_physics=0.1, lambda_smooth=0.05)
     optimizer = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(epochs-5, 1))
 
-    best_val_loss = float("inf")
-    patience = max(10, epochs // 4)
+    # Linear warmup (5 ep) + cosine
+    warmup = 5
+    def _lr_lambda(ep):
+        if ep < warmup:
+            return (ep + 1) / warmup
+        prog = (ep - warmup) / max(epochs - warmup, 1)
+        return max(0.05, 0.5 * (1.0 + np.cos(np.pi * prog)))
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=_lr_lambda)
+
+    patience     = max(10, epochs // 4)
     patience_ctr = 0
-    best_state = None
+    best_val_mae = float("inf")
+    best_state   = None
+    epoch        = 0
 
     for epoch in range(1, epochs + 1):
-        # train
+        # --- train ---
         model.train()
         for batch in train_loader:
-            batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+            batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
+                     for k, v in batch.items()}
             optimizer.zero_grad()
             out  = model(batch["discharge"], batch["eis"], batch["physics"])
-            loss = criterion(out["soh_pred"], batch["soh_label"], cycle_age=batch.get("cycle_idx"))
+            loss = criterion(out["soh_pred"], batch["soh_label"],
+                             cycle_age=batch.get("cycle_idx"))
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
-        if epoch > 5:
-            scheduler.step()
+        scheduler.step()
 
-        # validate
+        # --- validate (track val MAE, not val loss) ---
         model.eval()
-        vl = 0.0
+        val_preds, val_tgts = [], []
         with torch.no_grad():
             for batch in val_loader:
-                batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-                out  = model(batch["discharge"], batch["eis"], batch["physics"])
-                vl  += criterion(out["soh_pred"], batch["soh_label"]).item()
-        vl /= max(len(val_loader), 1)
+                batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
+                         for k, v in batch.items()}
+                out = model(batch["discharge"], batch["eis"], batch["physics"])
+                val_preds.extend(out["soh_pred"].view(-1).cpu().numpy().tolist())
+                val_tgts.extend(batch["soh_label"].view(-1).cpu().numpy().tolist())
 
-        if vl < best_val_loss - 1e-3:
-            best_val_loss = vl
-            patience_ctr  = 0
-            best_state    = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+        val_mae = float(np.mean(np.abs(np.array(val_preds) - np.array(val_tgts))))
+
+        if val_mae < best_val_mae - 1e-3:
+            best_val_mae = val_mae
+            patience_ctr = 0
+            best_state   = {k: v.cpu().clone() for k, v in model.state_dict().items()}
         else:
             patience_ctr += 1
         if patience_ctr >= patience:
             break
 
-    # Evaluate on test
+    # Load best weights
     if best_state is not None:
         model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
+
+    # --- test evaluation ---
     model.eval()
-    preds, targets = [], []
+    all_preds, all_tgts, all_bids = [], [], []
     with torch.no_grad():
         for batch in test_loader:
-            batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+            batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
+                     for k, v in batch.items()}
             out = model(batch["discharge"], batch["eis"], batch["physics"])
-            preds.extend(out["soh_pred"].view(-1).cpu().numpy().tolist())
-            targets.extend(batch["soh_label"].view(-1).cpu().numpy().tolist())
+            all_preds.extend(out["soh_pred"].view(-1).cpu().numpy().tolist())
+            all_tgts.extend(batch["soh_label"].view(-1).cpu().numpy().tolist())
+            bids = batch["battery_id"]
+            all_bids.extend(bids if isinstance(bids, list) else [bids] * len(all_preds))
 
-    metrics = _compute_metrics(np.array(preds), np.array(targets))
-    metrics["epoch_stopped"] = epoch
-    return metrics
+    preds   = np.array(all_preds)
+    targets = np.array(all_tgts)
+    bids_arr = np.array(all_bids)
 
+    overall = _compute_metrics(preds, targets)
+    overall["epoch_stopped"] = epoch
+    overall["n_params"]      = n_params
+
+    # per-battery breakdown
+    per_bat: Dict[str, dict] = {}
+    for bid in np.unique(bids_arr):
+        mask = bids_arr == bid
+        per_bat[str(bid)] = _compute_metrics(preds[mask], targets[mask])
+
+    return overall, per_bat, preds, targets, bids_arr
+
+
+# ── Main ───────────────────────────────────────────────────────────────────
 
 def main(args):
-    from src.data.parse_mat import parse_all_mat_files
-    from src.data.pairing import pair_discharge_eis
+    paired_df, discharge_df = _load_data()
 
-    # ── Load data ──────────────────────────────────────────────────────────
-    dis_cache = ROOT / "data" / "processed" / "discharge_raw.pkl"
-    if dis_cache.exists():
-        discharge_df = pd.read_pickle(dis_cache)
+    # Battery groups
+    groups = classify_batteries(paired_df)
+    logger.info(f"Battery trajectory groups:")
+    logger.info(f"  Sufficient   (>={SUFFICIENT_CYCLES} cycles): {groups['sufficient']}")
+    logger.info(f"  Intermediate ({INSUFFICIENT_CYCLES}-{SUFFICIENT_CYCLES-1} cycles): {groups['intermediate']}")
+    logger.info(f"  Insufficient (<{INSUFFICIENT_CYCLES} cycles):  {groups['insufficient']}")
+
+    folds    = stratified_battery_kfold(paired_df, k=args.folds)
+    SEP      = "=" * 72
+    results  = {}
+
+    # ── LSTM size comparison ──────────────────────────────────────────────
+    if args.size_compare:
+        configs_to_run = LSTM_CONFIGS
     else:
-        discharge_df, eis_df = parse_all_mat_files("5. BatteryDataSet")
-        (ROOT / "data" / "processed").mkdir(parents=True, exist_ok=True)
-        discharge_df.to_pickle(dis_cache)
+        # Use only the config matching --hidden and --layers
+        configs_to_run = [{"hidden_size": args.hidden,
+                           "num_layers":  args.layers,
+                           "label":       f"LSTM-{args.hidden}x{args.layers}"}]
 
-    paired_df = _get_paired_df()
+    for cfg_lstm in configs_to_run:
+        hidden = cfg_lstm["hidden_size"]
+        layers = cfg_lstm["num_layers"]
+        label  = cfg_lstm["label"]
 
-    # ── P1b: identify short-trajectory batteries ───────────────────────────
-    cycles_per_bat = paired_df.groupby("battery_id").size()
-    short_bats = cycles_per_bat[cycles_per_bat < MIN_CYCLES_THRESHOLD].index.tolist()
-    logger.info(f"Short-trajectory batteries (<{MIN_CYCLES_THRESHOLD} cycles): {short_bats}")
+        print(f"\n{SEP}")
+        print(f"Config: {label}  |  {args.folds}-fold CV  |  {args.epochs} epochs/fold")
+        print(SEP)
 
-    # ── P1a: k-fold CV ────────────────────────────────────────────────────
-    folds = stratified_battery_kfold(paired_df, k=args.folds)
+        fold_all: List[dict]  = []
+        fold_suf: List[dict]  = []
+        fold_ins: List[dict]  = []
 
-    all_metrics, all_metrics_excl = [], []
-    SEP = "─" * 70
+        for fold_idx, (train_bats, test_bats) in enumerate(folds):
+            train_df = paired_df[paired_df["battery_id"].isin(train_bats)].reset_index(drop=True)
+            test_df  = paired_df[paired_df["battery_id"].isin(test_bats)].reset_index(drop=True)
 
-    logger.info(f"\n{'='*70}")
-    logger.info(f"Battery-group {args.folds}-fold cross-validation  ({args.epochs} epochs/fold)")
-    logger.info(f"{'='*70}")
+            suf_in_test  = [b for b in test_bats if b in groups["sufficient"]]
+            ins_in_test  = [b for b in test_bats if b in groups["insufficient"]]
+            int_in_test  = [b for b in test_bats if b in groups["intermediate"]]
 
-    for fold_idx, (train_bats, test_bats) in enumerate(folds):
-        train_df = paired_df[paired_df["battery_id"].isin(train_bats)].reset_index(drop=True)
-        test_df  = paired_df[paired_df["battery_id"].isin(test_bats)].reset_index(drop=True)
+            logger.info(f"\n  Fold {fold_idx+1}/{args.folds}  "
+                        f"train={len(train_bats)} bats  test={test_bats}")
+            logger.info(f"    sufficient={suf_in_test}  "
+                        f"intermediate={int_in_test}  "
+                        f"insufficient={ins_in_test}")
 
-        test_short = [b for b in test_bats if b in short_bats]
-        logger.info(f"\nFold {fold_idx+1}/{args.folds}  "
-                    f"train={len(train_bats)} bats  "
-                    f"test={test_bats}  "
-                    f"(short: {test_short if test_short else 'none'})")
+            m_all, per_bat, preds, targets, bids = train_and_eval_fold(
+                train_df, test_df, discharge_df,
+                epochs=args.epochs, device_str=args.device,
+                lstm_hidden=hidden, lstm_layers=layers,
+            )
+            fold_all.append(m_all)
 
-        m = train_and_eval_fold(train_df, test_df, discharge_df, args.epochs, args.device)
-        all_metrics.append(m)
-        logger.info(f"  ALL  — MAE={m['mae']:.3f}%  RMSE={m['rmse']:.3f}%  R²={m['r2']:.4f}  "
-                    f"(stopped epoch {m.get('epoch_stopped','?')})")
+            logger.info(f"    ALL  MAE={m_all['mae']:.3f}%  "
+                        f"RMSE={m_all['rmse']:.3f}%  R^2={m_all['r2']:.4f}  "
+                        f"params={m_all.get('n_params',0):,}  "
+                        f"ep={m_all.get('epoch_stopped','?')}")
 
-        # P1b: metrics excluding short-trajectory batteries from test
-        test_excl_df = test_df[~test_df["battery_id"].isin(short_bats)].reset_index(drop=True)
-        if not test_excl_df.empty and len(test_excl_df) != len(test_df):
-            # Re-evaluate model on filtered test set (model already trained)
-            # Quick workaround: recompute from predictions via same loader approach
-            # We retrain nothing; just filter rows
-            from src.data.dataset import BaFuseDataset, TARGET_SEQ_LEN
-            from torch.utils.data import DataLoader
-            from src.models.bafuse import BaFuse
-            # Rebuild test loader on excl set with train stats
-            train_ds_tmp = BaFuseDataset(
-                train_df, discharge_data_df=discharge_df, normalize=True)
-            test_ds_excl = BaFuseDataset(
-                test_excl_df, discharge_data_df=discharge_df,
-                normalize=True, external_stats=train_ds_tmp.stats)
-            excl_loader = DataLoader(test_ds_excl, batch_size=32, shuffle=False)
+            # Sufficient subset metrics
+            suf_mask = np.isin(bids, groups["sufficient"])
+            if suf_mask.sum() > 0:
+                m_suf = _compute_metrics(preds[suf_mask], targets[suf_mask])
+                fold_suf.append(m_suf)
+                logger.info(f"    SUF  MAE={m_suf['mae']:.3f}%  "
+                            f"RMSE={m_suf['rmse']:.3f}%  R^2={m_suf['r2']:.4f}  "
+                            f"(n={m_suf['n']})")
 
-            # Need model — just use naive baseline for comparison since model gone
-            # Actually: store preds per battery_id in train_and_eval_fold is complex
-            # Instead report % of test set excluded
-            n_excl = len(test_excl_df)
-            n_total = len(test_df)
-            logger.info(f"  EXCL short bats — {n_excl}/{n_total} samples remain (excluded: {test_short})")
-            all_metrics_excl.append({"note": f"fold {fold_idx+1} partial", "excluded": test_short})
-        else:
-            all_metrics_excl.append(m)
+            # Insufficient subset metrics
+            ins_mask = np.isin(bids, groups["insufficient"])
+            if ins_mask.sum() > 0:
+                m_ins = _compute_metrics(preds[ins_mask], targets[ins_mask])
+                fold_ins.append(m_ins)
+                logger.info(f"    INS  MAE={m_ins['mae']:.3f}%  "
+                            f"RMSE={m_ins['rmse']:.3f}%  R^2={m_ins['r2']:.4f}  "
+                            f"(n={m_ins['n']})")
 
-    # ── Summary ───────────────────────────────────────────────────────────
-    print(f"\n{SEP}")
-    print(f"{args.folds}-FOLD CV RESULTS  (all batteries)")
-    print(SEP)
-    for i, m in enumerate(all_metrics):
-        print(f"  Fold {i+1}: MAE={m['mae']:.3f}%  RMSE={m['rmse']:.3f}%  R²={m['r2']:.4f}")
+        # ── Per-config summary ────────────────────────────────────────────
+        mae_m,  mae_s  = _summarise(fold_all, "mae")
+        rmse_m, rmse_s = _summarise(fold_all, "rmse")
+        r2_m,   r2_s   = _summarise(fold_all, "r2")
 
-    maes  = [m["mae"]  for m in all_metrics if not np.isnan(m["mae"])]
-    rmses = [m["rmse"] for m in all_metrics if not np.isnan(m["rmse"])]
-    r2s   = [m["r2"]   for m in all_metrics if not np.isnan(m["r2"])]
+        suf_mae_m, suf_mae_s = _summarise(fold_suf, "mae")
+        ins_mae_m, ins_mae_s = _summarise(fold_ins, "mae")
 
-    print(SEP)
-    print(f"  Mean ± std:")
-    print(f"    MAE  = {np.mean(maes):.3f} ± {np.std(maes):.3f} %")
-    print(f"    RMSE = {np.mean(rmses):.3f} ± {np.std(rmses):.3f} %")
-    print(f"    R²   = {np.mean(r2s):.4f} ± {np.std(r2s):.4f}")
-    print(SEP)
+        print(f"\n  {'─'*68}")
+        print(f"  {label}  --  {args.folds}-fold summary")
+        print(f"  {'─'*68}")
+        print(f"  ALL batteries:")
+        print(f"    MAE  = {mae_m:6.3f} +/- {mae_s:.3f} %")
+        print(f"    RMSE = {rmse_m:6.3f} +/- {rmse_s:.3f} %")
+        print(f"    R^2  = {r2_m:6.4f} +/- {r2_s:.4f}")
 
-    # P1b summary
-    print(f"\n  P1b — Short-trajectory batteries (<{MIN_CYCLES_THRESHOLD} cycles): {short_bats}")
-    print(f"  These batteries have limited SoH range and may skew per-fold R².")
-    print(f"  Recommendation: report CV results with and without these batteries.\n")
+        if fold_suf:
+            print(f"  Sufficient (>={SUFFICIENT_CYCLES} cycles):")
+            print(f"    MAE  = {suf_mae_m:6.3f} +/- {suf_mae_s:.3f} %"
+                  f"   [{groups['sufficient']}]")
+        if fold_ins:
+            print(f"  Insufficient (<{INSUFFICIENT_CYCLES} cycles)  [excluded from main metric]:")
+            print(f"    MAE  = {ins_mae_m:6.3f} +/- {ins_mae_s:.3f} %"
+                  f"   [{groups['insufficient']}]")
+        print(f"  {'─'*68}")
 
-    # Save
+        results[label] = {
+            "hidden_size": hidden,
+            "num_layers":  layers,
+            "n_params":    fold_all[0].get("n_params", 0) if fold_all else 0,
+            "per_fold":    fold_all,
+            "summary_all": {
+                "mae_mean": mae_m, "mae_std": mae_s,
+                "rmse_mean": rmse_m, "rmse_std": rmse_s,
+                "r2_mean": r2_m, "r2_std": r2_s,
+            },
+            "summary_sufficient": {
+                "mae_mean": suf_mae_m, "mae_std": suf_mae_s,
+            } if fold_suf else {},
+            "summary_insufficient": {
+                "mae_mean": ins_mae_m, "mae_std": ins_mae_s,
+            } if fold_ins else {},
+        }
+
+    # ── Cross-config comparison ───────────────────────────────────────────
+    if len(results) > 1:
+        print(f"\n{SEP}")
+        print("LSTM SIZE COMPARISON  (sorted by ALL-batteries MAE)")
+        print(SEP)
+        ranked = sorted(
+            results.items(),
+            key=lambda kv: kv[1]["summary_all"].get("mae_mean", 99),
+        )
+        print(f"  {'Config':30s}  {'Params':>10s}  {'MAE (all)':>14s}  "
+              f"{'MAE (suf)':>14s}  {'R^2 (all)':>12s}")
+        print(f"  {'─'*80}")
+        for lbl, r in ranked:
+            mae_str = (f"{r['summary_all']['mae_mean']:.3f}"
+                       f"+/-{r['summary_all']['mae_std']:.3f}")
+            suf     = r.get("summary_sufficient", {})
+            suf_str = (f"{suf['mae_mean']:.3f}+/-{suf['mae_std']:.3f}"
+                       if suf else "  n/a")
+            r2_str  = (f"{r['summary_all']['r2_mean']:.4f}"
+                       f"+/-{r['summary_all']['r2_std']:.4f}")
+            print(f"  {lbl:30s}  {r['n_params']:>10,}  {mae_str:>14s}  "
+                  f"{suf_str:>14s}  {r2_str:>12s}")
+        print(f"  {'─'*80}")
+        best_lbl = ranked[0][0]
+        print(f"  Best config: {best_lbl}")
+        print(SEP)
+
+    # ── Battery groups reference ──────────────────────────────────────────
+    print(f"\n  Battery trajectory classification")
+    print(f"  {'─'*50}")
+    counts = paired_df.groupby("battery_id").size().to_dict()
+    for bid in sorted(counts.keys()):
+        n = counts[bid]
+        g = ("SUFFICIENT   "  if n >= SUFFICIENT_CYCLES
+             else "INSUFFICIENT " if n < INSUFFICIENT_CYCLES
+             else "INTERMEDIATE ")
+        print(f"    {bid:8s}  {n:4d} cycles  [{g}]")
+
+    # ── Save ──────────────────────────────────────────────────────────────
     out = ROOT / "results"
     out.mkdir(exist_ok=True)
-    cv_results = {
-        "folds": args.folds,
-        "epochs_per_fold": args.epochs,
-        "per_fold": all_metrics,
-        "summary": {
-            "mae_mean":  float(np.mean(maes)),
-            "mae_std":   float(np.std(maes)),
-            "rmse_mean": float(np.mean(rmses)),
-            "rmse_std":  float(np.std(rmses)),
-            "r2_mean":   float(np.mean(r2s)),
-            "r2_std":    float(np.std(r2s)),
-        },
-        "short_trajectory_batteries": short_bats,
-    }
-    with open(out / "cv_results.json", "w") as f:
-        json.dump(cv_results, f, indent=2)
-    logger.info(f"CV results saved → {out / 'cv_results.json'}")
+    out_path = out / "cv_results.json"
+    with open(out_path, "w") as f:
+        json.dump({
+            "folds": args.folds,
+            "epochs_per_fold": args.epochs,
+            "battery_groups": groups,
+            "configs": results,
+        }, f, indent=2, default=str)
+    logger.info(f"Results saved to {out_path}")
 
 
 if __name__ == "__main__":
-    p = argparse.ArgumentParser()
-    p.add_argument("--folds",   type=int, default=5)
-    p.add_argument("--epochs",  type=int, default=30)
-    p.add_argument("--device",  default="cpu")
+    p = argparse.ArgumentParser(description="Battery-group k-fold CV for BaFuse")
+    p.add_argument("--folds",          type=int,  default=5)
+    p.add_argument("--epochs",         type=int,  default=30)
+    p.add_argument("--device",         default="cpu")
+    p.add_argument("--hidden",         type=int,  default=256,
+                   help="LSTM hidden size (used when --no-size-compare)")
+    p.add_argument("--layers",         type=int,  default=3,
+                   help="LSTM num_layers (used when --no-size-compare)")
+    p.add_argument("--no-size-compare", dest="size_compare",
+                   action="store_false", default=True,
+                   help="Skip LSTM size comparison, run only --hidden/--layers config")
     main(p.parse_args())
+

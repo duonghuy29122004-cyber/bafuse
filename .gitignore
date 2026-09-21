@@ -23,7 +23,7 @@ wheels/
 .installed.cfg
 *.egg
 
-# Data
+# Data — ignore processed outputs but NOT source code
 data/raw/*.mat
 data/processed/*.pkl
 data/processed/*.csv

@@ -210,7 +210,7 @@ streamlit run app/dashboard.py
 ✅ **Ablation studies** - Quantify synergy between modalities  
 ✅ **Uncertainty quantification** - MC Dropout for confidence intervals  
 ✅ **Interactive dashboard** - Explore predictions and modality contributions  
-
+ 
 ## Results
 
 Expected improvements over unimodal baselines:

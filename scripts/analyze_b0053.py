@@ -1,5 +1,5 @@
-"""
-Analyze B0053 vs other test batteries — capacity trajectory + SoH distribution.
+﻿"""
+Analyze B0053 vs other test batteries -- capacity trajectory + SoH distribution.
 """
 import sys
 from pathlib import Path
@@ -26,7 +26,7 @@ else:
 TEST_BATTERIES = ["B0005", "B0026", "B0039", "B0045", "B0048", "B0051", "B0053"]
 
 print("=" * 65)
-print("Capacity trajectory — test batteries")
+print("Capacity trajectory -- test batteries")
 print("=" * 65)
 print(f"{'Battery':8}  {'N_cyc':6}  {'cap_min':8}  {'cap_max':8}  {'cap_mean':8}  {'soh_min':7}  {'soh_max':7}  {'range':7}")
 print("-" * 65)
@@ -47,7 +47,7 @@ for bid in TEST_BATTERIES:
 # B0053 detailed
 print()
 print("=" * 65)
-print("B0053 — detailed capacity per cycle")
+print("B0053 -- detailed capacity per cycle")
 print("=" * 65)
 b53 = paired_df[paired_df["battery_id"] == "B0053"].sort_values("discharge_cycle")
 print(b53[["discharge_cycle", "capacity_ahr", "impedance_ohm", "voltage_min"]].to_string(index=False))
@@ -55,7 +55,8 @@ print(b53[["discharge_cycle", "capacity_ahr", "impedance_ohm", "voltage_min"]].t
 # Compare with a "normal" battery from train set
 print()
 print("=" * 65)
-print("B0005 (train) — capacity per cycle (first 20)")
+print("B0005 (train) -- capacity per cycle (first 20)")
 print("=" * 65)
 b5 = paired_df[paired_df["battery_id"] == "B0005"].sort_values("discharge_cycle").head(20)
 print(b5[["discharge_cycle", "capacity_ahr", "impedance_ohm", "voltage_min"]].to_string(index=False))
+

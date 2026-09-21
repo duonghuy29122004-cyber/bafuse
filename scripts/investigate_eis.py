@@ -122,7 +122,7 @@ def main():
         scores = -cross_val_score(pipe, X, y, cv=5,
                                   scoring="neg_mean_absolute_error",
                                   groups=None)
-        print(f"  {name:20s}: MAE = {scores.mean():.3f} ± {scores.std():.3f} %")
+        print(f"  {name:20s}: MAE = {scores.mean():.3f} +/- {scores.std():.3f} %")
 
     # ── CHECK 5: EIS signal per battery ───────────────────────────────
     print(f"\n{SEP}")
@@ -148,17 +148,17 @@ def main():
     nan_re   = paired_df["re_ohm"].isna().mean() * 100
     nan_rct  = paired_df["rct_ohm"].isna().mean() * 100
 
-    print(f"  impedance_ohm ↔ SoH correlation : {imp_corr:+.4f}")
-    print(f"  re_ohm        ↔ SoH correlation : {re_corr:+.4f}")
+    print(f"  impedance_ohm - SoH correlation : {imp_corr:+.4f}")
+    print(f"  re_ohm        - SoH correlation : {re_corr:+.4f}")
     print(f"  re_ohm NaN rate                 : {nan_re:.1f}%")
     print(f"  rct_ohm NaN rate                : {nan_rct:.1f}%")
 
     if abs(imp_corr) < 0.3:
-        print("\n  ⚠ LOW EIS-SoH correlation — EIS in this dataset has limited")
+        print("\n  [!] LOW EIS-SoH correlation -- EIS in this dataset has limited")
         print("    predictive power beyond what discharge curve already captures.")
         print("    This is a valid finding for the report (not a model bug).")
     else:
-        print(f"\n  EIS has moderate correlation ({imp_corr:.3f}) — the ~0% contribution")
+        print(f"\n  EIS has moderate correlation ({imp_corr:.3f}) -- the ~0% contribution")
         print("    in ablation is likely due to attention imbalance (discharge dominates).")
         print("    Recommend: try WeightedFusion or explicit EIS loss term.")
 

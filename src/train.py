@@ -1,4 +1,4 @@
-"""
+﻿"""
 Training loop for BaFuse model.
 
 Handles:
@@ -42,7 +42,7 @@ def _batch_to_device(batch: Dict, device: torch.device) -> Dict:
 
 
 def _compute_metrics(preds: np.ndarray, targets: np.ndarray) -> Dict[str, float]:
-    """Compute MAE, RMSE, R²."""
+    """Compute MAE, RMSE, R^2."""
     mae = float(np.mean(np.abs(preds - targets)))
     rmse = float(np.sqrt(np.mean((preds - targets) ** 2)))
     ss_res = np.sum((targets - preds) ** 2)
@@ -84,7 +84,11 @@ def train_epoch(
         outputs = model(discharge, eis, physics)
         pred = outputs["soh_pred"]
 
-        loss = criterion(pred, soh_label, cycle_age=cycle_idx)
+        # Task 2: pass battery_ids for within-battery monotonicity loss
+        battery_ids = batch.get("battery_id")
+        if isinstance(battery_ids, torch.Tensor):
+            battery_ids = None  # shouldn't happen but guard
+        loss = criterion(pred, soh_label, cycle_age=cycle_idx, battery_ids=battery_ids)
         loss.backward()
 
         # Gradient clipping for stability
@@ -178,6 +182,7 @@ def train(
         latent_dim=model_cfg.get("latent_dim", 64),
         fusion_method=model_cfg.get("fusion_method", "cross_attention"),
         fusion_dim=model_cfg.get("fusion_dim", 128),
+        physics_encoder_type=model_cfg.get("physics_encoder_type", "mlp"),  # Task 3
     ).to(torch_device)
 
     # ---- Loss ----
@@ -219,7 +224,8 @@ def train(
     patience = int(es_cfg.get("patience", 15))
     min_delta = float(es_cfg.get("min_delta", 0.001))
     best_val_loss = float("inf")
-    best_val_mae  = float("inf")   # P4: track MAE — more stable than loss on small val set
+    best_val_mae  = float("inf")
+    best_val_metrics: Dict = {}     # BUG FIX: store metrics of best epoch
     patience_counter = 0
 
     # ---- Checkpoint dir ----
@@ -254,15 +260,16 @@ def train(
             f"Epoch {epoch:3d}/{num_epochs}  "
             f"train_loss={train_loss:.4f}  val_loss={val_loss:.4f}  "
             f"MAE={val_metrics['mae']:.3f}  RMSE={val_metrics['rmse']:.3f}  "
-            f"R²={val_metrics['r2']:.4f}  "
+            f"R^2={val_metrics['r2']:.4f}  "
             f"lr={scheduler.get_last_lr()[0]:.2e}"
         )
 
-        # Save best checkpoint — use val MAE (more stable than loss on small val set)
+        # Save best checkpoint -- use val MAE (more stable than loss on small val set)
         current_mae = val_metrics["mae"]
         if current_mae < best_val_mae - min_delta:
-            best_val_loss = val_loss
-            best_val_mae  = current_mae
+            best_val_loss    = val_loss
+            best_val_mae     = current_mae
+            best_val_metrics = val_metrics.copy()   # BUG FIX: capture best epoch metrics
             patience_counter = 0
             ckpt_path = ckpt_dir / "best_model.pth"
             torch.save(
@@ -276,7 +283,7 @@ def train(
                 },
                 ckpt_path,
             )
-            logger.info(f"  ✓ Saved best checkpoint (MAE={current_mae:.3f}%) → {ckpt_path}")
+            logger.info(f"  OK Saved best checkpoint (MAE={current_mae:.3f}%) -> {ckpt_path}")
         else:
             patience_counter += 1
 
@@ -287,8 +294,25 @@ def train(
     # Load best weights before returning
     best_ckpt = ckpt_dir / "best_model.pth"
     if best_ckpt.exists():
-        state = torch.load(best_ckpt, map_location=torch_device)
+        # weights_only=False needed because checkpoint dict contains numpy scalars in config
+        state = torch.load(best_ckpt, map_location=torch_device, weights_only=False)
         model.load_state_dict(state["model_state_dict"])
-        logger.info("Loaded best checkpoint weights")
+        # BUG FIX: log the actual best-checkpoint metrics, not the last epoch
+        bm = best_val_metrics or state.get("val_metrics", {})
+        logger.info(
+            f"Loaded best checkpoint (epoch {state.get('epoch','?')})  "
+            f"val MAE={bm.get('mae', float('nan')):.3f}%  "
+            f"RMSE={bm.get('rmse', float('nan')):.3f}%  "
+            f"R^2={bm.get('r2', float('nan')):.4f}"
+        )
+        # Patch history so callers read best-epoch values, not last-epoch
+        history["best_val_mae"]  = bm.get("mae",  float("nan"))
+        history["best_val_rmse"] = bm.get("rmse", float("nan"))
+        history["best_val_r2"]   = bm.get("r2",   float("nan"))
+    else:
+        history["best_val_mae"]  = history["val_mae"][-1]  if history["val_mae"]  else float("nan")
+        history["best_val_rmse"] = history["val_rmse"][-1] if history["val_rmse"] else float("nan")
+        history["best_val_r2"]   = history["val_r2"][-1]   if history["val_r2"]   else float("nan")
 
     return model, history
+

@@ -1,5 +1,5 @@
-"""
-BaFuse end-to-end pipeline: data → train → evaluate.
+﻿"""
+BaFuse end-to-end pipeline: data -> train -> evaluate.
 
 Usage:
     python run_pipeline.py                         # full run (CPU)
@@ -42,7 +42,7 @@ def main(args):
     # 1. PARSE
     # =========================================================
     logger.info("=" * 60)
-    logger.info("STEP 1 — Parse .mat files")
+    logger.info("STEP 1 -- Parse .mat files")
     logger.info("=" * 60)
     discharge_df, eis_df = parse_all_mat_files(args.data_dir)
     logger.info(f"  discharge records : {len(discharge_df):,}")
@@ -61,7 +61,7 @@ def main(args):
     # =========================================================
     # 2. PAIR
     # =========================================================
-    logger.info("\nSTEP 2 — Pair discharge ↔ EIS")
+    logger.info("\nSTEP 2 -- Pair discharge <-> EIS")
     paired_df = pair_discharge_eis(discharge_df, eis_df, max_cycle_gap=2)
     logger.info(f"  pairs created     : {len(paired_df):,}")
 
@@ -77,7 +77,7 @@ def main(args):
     # =========================================================
     # 3. SPLIT
     # =========================================================
-    logger.info("\nSTEP 3 — Battery-level split (60/20/20)")
+    logger.info("\nSTEP 3 -- Battery-level split (60/20/20)")
     train_df, val_df, test_df = split_by_battery(
         paired_df,
         train_ratio=0.6,
@@ -94,7 +94,7 @@ def main(args):
     # =========================================================
     # 4. DATALOADERS
     # =========================================================
-    logger.info("\nSTEP 4 — Build DataLoaders")
+    logger.info("\nSTEP 4 -- Build DataLoaders")
     train_loader, val_loader, test_loader = create_dataloaders(
         train_df,
         val_df,
@@ -121,7 +121,7 @@ def main(args):
     # =========================================================
     # 5. BUILD MODEL
     # =========================================================
-    logger.info("\nSTEP 5 — Build BaFuse model")
+    logger.info("\nSTEP 5 -- Build BaFuse model")
     device_str = args.device if (args.device == "cpu" or torch.cuda.is_available()) else "cpu"
     device = torch.device(device_str)
 
@@ -132,6 +132,7 @@ def main(args):
         latent_dim=64,
         fusion_method="cross_attention",
         fusion_dim=128,
+        physics_encoder_type=args.physics_encoder,   # Task 3
     ).to(device)
 
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -140,7 +141,7 @@ def main(args):
     # =========================================================
     # 6. TRAIN
     # =========================================================
-    logger.info("\nSTEP 6 — Training")
+    logger.info("\nSTEP 6 -- Training")
     # Override config with CLI args by patching config.yaml temporarily
     import yaml
     cfg_path = str(ROOT / "configs" / "config.yaml")
@@ -154,6 +155,7 @@ def main(args):
     cfg["training"]["num_epochs"] = args.epochs
     cfg["training"]["early_stopping"]["patience"] = args.patience
     cfg["device"] = device_str
+    cfg["model"]["physics_encoder_type"] = args.physics_encoder  # Task 3
 
     tmp_cfg = str(out / "_runtime_config.yaml")
     with open(tmp_cfg, "w") as f:
@@ -165,30 +167,31 @@ def main(args):
         val_loader=val_loader,
         device=device_str,
     )
-    logger.info(f"  final val MAE     : {history['val_mae'][-1]:.3f}%")
-    logger.info(f"  final val RMSE    : {history['val_rmse'][-1]:.3f}%")
-    logger.info(f"  final val R²      : {history['val_r2'][-1]:.4f}")
+    # BUG FIX: log best-checkpoint metrics, not last-epoch metrics
+    logger.info(f"  best val MAE      : {history['best_val_mae']:.3f}%")
+    logger.info(f"  best val RMSE     : {history['best_val_rmse']:.3f}%")
+    logger.info(f"  best val R^2      : {history['best_val_r2']:.4f}")
 
     # =========================================================
     # 7. EVALUATE
     # =========================================================
-    logger.info("\nSTEP 7 — Test set evaluation")
+    logger.info("\nSTEP 7 -- Test set evaluation")
     results = evaluate(trained_model, test_loader, device)
     ov = results["overall"]
     logger.info(f"  Test MAE          : {ov['mae']:.3f}%")
     logger.info(f"  Test RMSE         : {ov['rmse']:.3f}%")
-    logger.info(f"  Test R²           : {ov['r2']:.4f}")
+    logger.info(f"  Test R^2          : {ov['r2']:.4f}")
     logger.info(f"  Test MAPE         : {ov['mape']:.2f}%")
 
     # Per-battery
     logger.info("  Per-battery MAE:")
     for bid, m in results["per_battery"].items():
-        logger.info(f"    {bid}: MAE={m['mae']:.3f}%  R²={m['r2']:.4f}")
+        logger.info(f"    {bid}: MAE={m['mae']:.3f}%  R^2={m['r2']:.4f}")
 
     # =========================================================
     # 8. MODALITY CONTRIBUTIONS
     # =========================================================
-    logger.info("\nSTEP 8 — Modality contribution analysis")
+    logger.info("\nSTEP 8 -- Modality contribution analysis")
     contrib = analyze_modality_contribution(trained_model, test_loader, device)
     logger.info(f"  Discharge : {contrib['discharge']*100:.1f}%")
     logger.info(f"  EIS       : {contrib['eis']*100:.1f}%")
@@ -212,10 +215,10 @@ def main(args):
     with open(results_dir / "summary.json", "w") as f:
         json.dump(summary, f, indent=2)
 
-    logger.info(f"\n  Results saved → {results_dir / 'summary.json'}")
+    logger.info(f"\n  Results saved -> {results_dir / 'summary.json'}")
 
     logger.info("\n" + "=" * 60)
-    logger.info("✓  Pipeline complete!")
+    logger.info("[OK]  Pipeline complete!")
     logger.info("=" * 60)
     return 0
 
@@ -228,5 +231,8 @@ if __name__ == "__main__":
     p.add_argument("--epochs", type=int, default=50)
     p.add_argument("--patience", type=int, default=10)
     p.add_argument("--device", default="cpu", choices=["cpu", "cuda"])
+    p.add_argument("--physics_encoder", default="mlp", choices=["mlp", "cnn1d"],
+                   help="Physics encoder type: mlp (default) or cnn1d (Task 3 experiment)")
     args = p.parse_args()
     sys.exit(main(args))
+

@@ -1,21 +1,19 @@
 """
 Loss functions including physics-informed regularization.
 
-Strategies:
-- MSE loss for SoH prediction
-- Physics-informed regularization (e.g., monotonic SoH, smooth degradation)
-- Ablation loss to encourage each modality to contribute unique information
+Task 2 fix: _smoothness_loss now compares ONLY within the same battery_id.
+Cross-battery comparison was a logic bug — different batteries age at different
+rates, so 'older cycle => lower SoH' is only valid within one battery's trajectory.
 """
 
 import torch
 import torch.nn as nn
-from typing import Dict, Optional
+from collections import defaultdict
+from typing import Dict, List, Optional
 
 
 class SoHPredictionLoss(nn.Module):
-    """
-    SoH prediction loss with optional physics-informed regularization.
-    """
+    """SoH prediction loss with physics-informed regularization."""
 
     def __init__(
         self,
@@ -23,142 +21,107 @@ class SoHPredictionLoss(nn.Module):
         lambda_physics: float = 0.1,
         lambda_smooth: float = 0.05,
     ):
-        """
-        Args:
-            base_loss: "mse" or "mae" for regression
-            lambda_physics: Weight for physics constraints
-            lambda_smooth: Weight for smoothness (monotonic degradation)
-        """
         super().__init__()
         self.lambda_physics = lambda_physics
-        self.lambda_smooth = lambda_smooth
-
-        if base_loss == "mse":
-            self.base_loss_fn = nn.MSELoss()
-        else:
-            self.base_loss_fn = nn.L1Loss()
+        self.lambda_smooth  = lambda_smooth
+        self.base_loss_fn   = nn.MSELoss() if base_loss == "mse" else nn.L1Loss()
 
     def forward(
         self,
-        pred: torch.Tensor,
-        target: torch.Tensor,
-        cycle_age: Optional[torch.Tensor] = None,
+        pred:        torch.Tensor,
+        target:      torch.Tensor,
+        cycle_age:   Optional[torch.Tensor] = None,
+        battery_ids: Optional[List[str]]    = None,  # Task 2: for within-battery monotonicity
     ) -> torch.Tensor:
-        """
-        Compute loss with physics constraints.
-
-        Args:
-            pred: Predicted SoH (batch_size, 1)
-            target: Ground truth SoH (batch_size, 1)
-            cycle_age: (optional) Cycle age per sample, for smoothness constraint
-
-        Returns:
-            Scalar loss value
-        """
-        # Ensure shapes match
-        pred = pred.view(-1)
+        pred   = pred.view(-1)
         target = target.view(-1)
 
-        # Base regression loss
         loss = self.base_loss_fn(pred, target)
 
-        # Physics-informed bound constraint
         if self.lambda_physics > 0:
-            physics_loss = self._physics_regularization(pred)
-            loss = loss + self.lambda_physics * physics_loss
+            loss = loss + self.lambda_physics * self._physics_regularization(pred)
 
-        # Smoothness: SoH should degrade monotonically with cycle age
         if cycle_age is not None and self.lambda_smooth > 0:
-            smooth_loss = self._smoothness_loss(pred, cycle_age, target)
-            loss = loss + self.lambda_smooth * smooth_loss
+            loss = loss + self.lambda_smooth * self._smoothness_loss(pred, cycle_age, battery_ids)
 
         return loss
 
     def _physics_regularization(self, pred: torch.Tensor) -> torch.Tensor:
-        """
-        Penalise predictions outside physically valid range [0, 100].
-        Uses a soft ReLU (hinge) penalty.
-        """
-        # Penalty for pred < 0
-        lower_violation = torch.relu(-pred)          # positive where pred < 0
-        # Penalty for pred > 100
-        upper_violation = torch.relu(pred - 100.0)   # positive where pred > 100
-        return (lower_violation + upper_violation).mean()
+        """Penalise predictions outside [0, 100]."""
+        return (torch.relu(-pred) + torch.relu(pred - 100.0)).mean()
 
     def _smoothness_loss(
         self,
-        pred: torch.Tensor,
-        cycle_age: torch.Tensor,
-        target: torch.Tensor,
+        pred:        torch.Tensor,
+        cycle_age:   torch.Tensor,
+        battery_ids: Optional[List[str]] = None,
     ) -> torch.Tensor:
         """
-        Encourage monotonically decreasing SoH with increasing cycle age.
+        Task 2 FIX: within-battery monotonicity only.
 
-        For pairs (i, j) where cycle_age[i] < cycle_age[j], penalise
-        pred[i] < pred[j] (i.e., younger battery predicted lower SoH).
-        Uses vectorised pairwise hinge for efficiency.
+        For each battery separately, for pairs (i, j) where cycle_age[i] < cycle_age[j],
+        penalise pred[i] < pred[j] (younger cycle predicted lower SoH than older cycle).
+
+        If battery_ids is None, falls back to cross-battery mode (old behaviour).
         """
         cycle_age = cycle_age.view(-1).float()
         B = pred.size(0)
         if B < 2:
             return pred.new_zeros(1).squeeze()
 
-        # Pairwise differences
-        age_diff = cycle_age.unsqueeze(1) - cycle_age.unsqueeze(0)   # (B, B)
-        soh_diff = pred.unsqueeze(1) - pred.unsqueeze(0)             # (B, B)
+        if battery_ids is None:
+            # Fallback: original cross-battery behaviour
+            age_diff = cycle_age.unsqueeze(1) - cycle_age.unsqueeze(0)
+            soh_diff = pred.unsqueeze(1)      - pred.unsqueeze(0)
+            mask     = (age_diff > 0).float()
+            return torch.relu(soh_diff * mask).mean()
 
-        # Where age_diff > 0: older battery → lower SoH expected → soh_diff should be < 0
-        # Penalise positive soh_diff when age_diff > 0
-        mask = (age_diff > 0).float()
-        violation = torch.relu(soh_diff) * mask   # (B, B)
-        return violation.mean()
+        # Within-battery-only
+        bid_to_idx: Dict[str, List[int]] = defaultdict(list)
+        for i, bid in enumerate(battery_ids):
+            bid_to_idx[str(bid)].append(i)
+
+        total = pred.new_zeros(1)
+        n_pairs = 0
+
+        for indices in bid_to_idx.values():
+            if len(indices) < 2:
+                continue
+            idx_t = torch.tensor(indices, dtype=torch.long, device=pred.device)
+            ages  = cycle_age[idx_t]
+            ps    = pred[idx_t]
+
+            age_diff = ages.unsqueeze(1) - ages.unsqueeze(0)   # (k, k)
+            soh_diff = ps.unsqueeze(1)   - ps.unsqueeze(0)     # (k, k)
+            mask     = (age_diff > 0).float()
+
+            total   = total + torch.relu(soh_diff * mask).sum()
+            n_pairs += int(mask.sum().item())
+
+        if n_pairs == 0:
+            return pred.new_zeros(1).squeeze()
+        return (total / n_pairs).squeeze()
 
 
 class ModalityContributionLoss(nn.Module):
-    """
-    Encourage each modality to contribute unique information to SoH.
-
-    Prevents one modality from dominating while others are ignored.
-    """
+    """Encourage modalities to contribute diverse (non-redundant) information."""
 
     def __init__(self, lambda_diversity: float = 0.01):
-        """
-        Args:
-            lambda_diversity: Weight for diversity term
-        """
         super().__init__()
         self.lambda_diversity = lambda_diversity
 
     def forward(
         self,
         discharge_latent: torch.Tensor,
-        eis_latent: torch.Tensor,
-        physics_latent: torch.Tensor,
+        eis_latent:       torch.Tensor,
+        physics_latent:   torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Compute diversity loss encouraging low correlation between modalities.
+        import torch.nn.functional as F
 
-        Penalises high cosine similarity between latent representations.
+        def _cos(a, b):
+            return (F.normalize(a, dim=-1) * F.normalize(b, dim=-1)).sum(dim=-1).mean()
 
-        Args:
-            discharge_latent: (batch_size, latent_dim)
-            eis_latent:       (batch_size, latent_dim)
-            physics_latent:   (batch_size, latent_dim)
-
-        Returns:
-            Scalar loss
-        """
-        def _cosine_sim(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-            a_n = nn.functional.normalize(a, dim=-1)
-            b_n = nn.functional.normalize(b, dim=-1)
-            return (a_n * b_n).sum(dim=-1).mean()
-
-        import torch.nn.functional as F  # noqa: F401 – already imported above but kept local
-
-        sim_de = _cosine_sim(discharge_latent, eis_latent)
-        sim_dp = _cosine_sim(discharge_latent, physics_latent)
-        sim_ep = _cosine_sim(eis_latent, physics_latent)
-
-        # Penalise high similarity (want diversity)
-        diversity_loss = (sim_de.abs() + sim_dp.abs() + sim_ep.abs()) / 3.0
-        return self.lambda_diversity * diversity_loss
+        sim = (_cos(discharge_latent, eis_latent).abs()
+               + _cos(discharge_latent, physics_latent).abs()
+               + _cos(eis_latent, physics_latent).abs()) / 3.0
+        return self.lambda_diversity * sim

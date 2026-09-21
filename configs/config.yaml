@@ -22,6 +22,7 @@ model:
   latent_dim: 64
   fusion_method: "cross_attention"
   fusion_dim: 128
+  physics_encoder_type: "mlp"   # Task 3: "mlp" | "cnn1d"
 
 # Encoders
 encoders:

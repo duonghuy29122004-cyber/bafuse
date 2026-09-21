@@ -1,8 +1,8 @@
-"""
-BaFuse sklearn pipeline — no PyTorch required.
+﻿"""
+BaFuse sklearn pipeline -- no PyTorch required.
 
 Sử dụng Random Forest và MLP (scikit-learn) để dự đoán SoH.
-Bao gồm: parse → pair → split → feature engineering → train → evaluate → ablation.
+Bao gồm: parse -> pair -> split -> feature engineering -> train -> evaluate -> ablation.
 
 Usage:
     python run_sklearn_pipeline.py
@@ -142,7 +142,7 @@ def main(args):
 
     # ── 1. Parse ──────────────────────────────────────────────
     logger.info("=" * 60)
-    logger.info("STEP 1 — Parse .mat files")
+    logger.info("STEP 1 -- Parse .mat files")
     logger.info("=" * 60)
     discharge_df, eis_df = parse_all_mat_files(args.data_dir)
     logger.info(f"  discharge records : {len(discharge_df):,}")
@@ -158,7 +158,7 @@ def main(args):
     eis_df.to_pickle(out / "eis_raw.pkl")
 
     # ── 2. Pair ───────────────────────────────────────────────
-    logger.info("\nSTEP 2 — Pair discharge ↔ EIS")
+    logger.info("\nSTEP 2 -- Pair discharge <-> EIS")
     paired_df = pair_discharge_eis(discharge_df, eis_df, max_cycle_gap=2)
     logger.info(f"  pairs created     : {len(paired_df):,}")
 
@@ -172,7 +172,7 @@ def main(args):
     paired_df.to_pickle(out / "paired.pkl")
 
     # ── 3. Split ──────────────────────────────────────────────
-    logger.info("\nSTEP 3 — Battery-level split (60/20/20)")
+    logger.info("\nSTEP 3 -- Battery-level split (60/20/20)")
     train_df, val_df, test_df = split_by_battery(
         paired_df, train_ratio=0.6, val_ratio=0.2, test_ratio=0.2,
         random_state=42, stratify_by_soh=True,
@@ -183,7 +183,7 @@ def main(args):
     test_df.to_pickle(out / "test.pkl")
 
     # ── 4. Features ───────────────────────────────────────────
-    logger.info("\nSTEP 4 — Feature engineering")
+    logger.info("\nSTEP 4 -- Feature engineering")
     X_train, y_train, feat_cols = build_features(train_df)
     X_val,   y_val,   _         = build_features(val_df)
     X_test,  y_test,  _         = build_features(test_df)
@@ -191,7 +191,7 @@ def main(args):
     logger.info(f"  train shape       : {X_train.shape}")
 
     # ── 5. Train three models ─────────────────────────────────
-    logger.info("\nSTEP 5 — Train models")
+    logger.info("\nSTEP 5 -- Train models")
 
     models = {
         "RandomForest": Pipeline([
@@ -221,19 +221,19 @@ def main(args):
     test_results = {}
 
     for name, pipe in models.items():
-        # Fit on train only first → validate
+        # Fit on train only first -> validate
         pipe.fit(X_train, y_train)
         val_pred = pipe.predict(X_val)
         val_m = compute_metrics(y_val, val_pred)
         val_results[name] = val_m
-        logger.info(f"  [{name}] Val  — MAE={val_m['mae']:.3f}  RMSE={val_m['rmse']:.3f}  R²={val_m['r2']:.4f}")
+        logger.info(f"  [{name}] Val  -- MAE={val_m['mae']:.3f}  RMSE={val_m['rmse']:.3f}  R^2={val_m['r2']:.4f}")
 
-        # Refit on train+val → test
+        # Refit on train+val -> test
         pipe.fit(X_trainval, y_trainval)
         test_pred = pipe.predict(X_test)
         test_m = compute_metrics(y_test, test_pred)
         test_results[name] = test_m
-        logger.info(f"  [{name}] Test — MAE={test_m['mae']:.3f}  RMSE={test_m['rmse']:.3f}  R²={test_m['r2']:.4f}")
+        logger.info(f"  [{name}] Test -- MAE={test_m['mae']:.3f}  RMSE={test_m['rmse']:.3f}  R^2={test_m['r2']:.4f}")
 
     # ── 6. Best model deep-dive ───────────────────────────────
     best_name = min(test_results, key=lambda k: test_results[k]["mae"])
@@ -251,10 +251,10 @@ def main(args):
     for bid, grp in test_df2.groupby("battery_id"):
         m = compute_metrics(grp["soh"].values, grp["pred"].values)
         per_bat[str(bid)] = m
-        logger.info(f"    {bid}: MAE={m['mae']:.3f}%  R²={m['r2']:.4f}")
+        logger.info(f"    {bid}: MAE={m['mae']:.3f}%  R^2={m['r2']:.4f}")
 
     # ── 7. Feature importance ─────────────────────────────────
-    logger.info("\nSTEP 6 — Feature importance (Random Forest)")
+    logger.info("\nSTEP 6 -- Feature importance (Random Forest)")
     rf_pipe = models["RandomForest"]
     rf_pipe.fit(X_trainval, y_trainval)
     importances = rf_pipe.named_steps["model"].feature_importances_
@@ -274,7 +274,7 @@ def main(args):
         logger.info(f"    {mod:12s}: {imp/total*100:.1f}%")
 
     # ── 8. Ablation study ─────────────────────────────────────
-    logger.info("\nSTEP 7 — Ablation study")
+    logger.info("\nSTEP 7 -- Ablation study")
     ablation = ablation_study(pd.concat([train_df, val_df]), test_df, feat_cols)
     base_mae = test_results["RandomForest"]["mae"]
     for key, m in ablation.items():
@@ -298,9 +298,9 @@ def main(args):
     with open(out_json, "w") as f:
         json.dump(summary, f, indent=2)
 
-    logger.info(f"\n  Results saved → {out_json}")
+    logger.info(f"\n  Results saved -> {out_json}")
     logger.info("\n" + "=" * 60)
-    logger.info("✓  Pipeline complete!")
+    logger.info("[OK]  Pipeline complete!")
     logger.info("=" * 60)
     return 0
 
@@ -311,3 +311,4 @@ if __name__ == "__main__":
     p.add_argument("--output_dir", default="data/processed")
     args = p.parse_args()
     sys.exit(main(args))
+

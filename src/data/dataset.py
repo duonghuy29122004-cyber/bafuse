@@ -34,9 +34,40 @@ PHYSICS_NUM_FEATURES = 4
 
 # Fallback aging model params (used only if train-population fit is unavailable)
 # Power-law: expected_fade_fraction = A * (age / N_ref)^b
+_DEFAULT_CUTOFF = 2.7   # fallback for unknown battery_id
+
+# Set to False to reproduce old fixed-2.7V behaviour (used in CV comparison config (a))
+_USE_PER_BATTERY_CUTOFF = True
+
+def get_cutoff_voltage(battery_id: str) -> float:
+    """Return discharge cutoff voltage for battery_id. Falls back to 2.7V if not found."""
+    if not _USE_PER_BATTERY_CUTOFF:
+        return 2.7
+    return BATTERY_CUTOFF_VOLTAGE.get(str(battery_id), _DEFAULT_CUTOFF)
+
+# ── Aging model fallback params ────────────────────────────────────────────
 _FALLBACK_AGING_A     = 0.20
 _FALLBACK_AGING_B     = 0.50
 _FALLBACK_AGING_N_REF = 168.0
+
+# ── Per-battery discharge cutoff voltages (from NASA PCoE README files) ────
+BATTERY_CUTOFF_VOLTAGE: Dict[str, float] = {
+    # Campaign 1 — BatteryAgingARC-FY08Q4
+    "B0005": 2.7, "B0006": 2.5, "B0007": 2.2, "B0018": 2.5,
+    # Campaign 2 & 3 — B0025-B0028 (same protocol)
+    "B0025": 2.0, "B0026": 2.2, "B0027": 2.5, "B0028": 2.7,
+    # Campaign 3 cont.
+    "B0029": 2.0, "B0030": 2.2, "B0031": 2.5, "B0032": 2.7,
+    "B0033": 2.0, "B0034": 2.2, "B0036": 2.7,
+    "B0038": 2.2, "B0039": 2.5, "B0040": 2.7,
+    "B0041": 2.0, "B0042": 2.2, "B0043": 2.5, "B0044": 2.7,
+    # Campaign 4
+    "B0045": 2.0, "B0046": 2.2, "B0047": 2.5, "B0048": 2.7,
+    # Campaign 5
+    "B0049": 2.0, "B0050": 2.2, "B0051": 2.5, "B0052": 2.7,
+    # Campaign 6
+    "B0053": 2.0, "B0054": 2.2, "B0055": 2.5, "B0056": 2.7,
+}
 
 
 def fit_aging_prior(train_df: pd.DataFrame) -> dict:
@@ -241,7 +272,15 @@ class BaFuseDataset(Dataset):
         # empirical_fade_prior uses fitted power-law from train population — NOT per-sample cap
         cycle_age      = float(discharge_cycle)
         cycle_age_norm = cycle_age / self.aging_params.get("N_ref", _FALLBACK_AGING_N_REF)
-        voltage_droop  = (row['voltage_min'] - 2.7) / 1.5
+        # Task 1 FIX: use per-battery cutoff voltage, not hardcoded 2.7 V
+        # voltage_droop measures how much voltage_min deviates FROM the cutoff —
+        # for a healthy battery this ≈ 0 (hits cutoff cleanly); as battery ages
+        # the curve sagging means it hits cutoff earlier → droop becomes more negative.
+        # With a fixed 2.7 V reference, batteries with cutoff=2.0 V (e.g. B0053)
+        # always show apparent "droop" even when healthy — confounds the feature.
+        cutoff_v       = get_cutoff_voltage(battery_id)
+        voltage_range  = max(4.2 - cutoff_v, 0.1)   # full discharge window width
+        voltage_droop  = (row['voltage_min'] - cutoff_v) / voltage_range
         impedance_rise = (
             (row['impedance_ohm'] - self.stats['impedance']['mean'])
             / self.stats['impedance']['std']

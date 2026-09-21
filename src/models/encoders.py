@@ -140,11 +140,6 @@ class PhysicsEncoder(nn.Module):
     """
 
     def __init__(self, num_physics_features: int = 10, latent_dim: int = 64):
-        """
-        Args:
-            num_physics_features: Number of physics-based features
-            latent_dim: Output latent dimension
-        """
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(num_physics_features, 256),
@@ -162,8 +157,59 @@ class PhysicsEncoder(nn.Module):
         """
         Args:
             x: (batch_size, num_physics_features)
-
         Returns:
             (batch_size, latent_dim)
         """
         return self.net(x)
+
+
+class PhysicsEncoderCNN(nn.Module):
+    """
+    Task 3: CNN 1D alternative for physics encoder.
+
+    Treats the 4-dim physics vector as a 1-channel sequence of length 4,
+    applies 1D convolutions to capture local interactions between adjacent
+    features (e.g. cycle_age ↔ empirical_prior, voltage_droop ↔ impedance_rise),
+    then projects to latent_dim.
+
+    Note: Physics features do NOT have a natural temporal ordering, so CNN1D
+    is an architectural experiment rather than a motivated design choice.
+    If MLP performs equally well or better, that result is reported as-is.
+
+    Output shape is identical to PhysicsEncoder → fully compatible with fusion.
+    """
+
+    def __init__(self, num_physics_features: int = 4, latent_dim: int = 64):
+        super().__init__()
+        # (B, 1, num_features) → conv layers
+        self.cnn = nn.Sequential(
+            # Layer 1: kernel=2 captures pairwise feature interactions
+            nn.Conv1d(in_channels=1, out_channels=16, kernel_size=2, padding=1),
+            nn.ReLU(),
+            # Layer 2: kernel=2 again, reduce length
+            nn.Conv1d(in_channels=16, out_channels=32, kernel_size=2, padding=0),
+            nn.ReLU(),
+        )
+        # After two convolutions on length-4 input with those params:
+        # L after conv1(k=2,pad=1): 4+2*1-2+1 = 5
+        # L after conv2(k=2,pad=0): 5-2+1 = 4
+        # → flatten: 32 * 4 = 128  (but safer to use AdaptiveAvgPool)
+        self.pool = nn.AdaptiveAvgPool1d(2)   # → (B, 32, 2)
+        self.head = nn.Sequential(
+            nn.Flatten(),                      # (B, 64)
+            nn.Linear(64, latent_dim),
+            nn.LayerNorm(latent_dim),
+            nn.ReLU(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (B, num_physics_features)
+        Returns:
+            (B, latent_dim)
+        """
+        x = x.unsqueeze(1)          # (B, 1, num_features)
+        x = self.cnn(x)             # (B, 32, ?)
+        x = self.pool(x)            # (B, 32, 2)
+        return self.head(x)         # (B, latent_dim)

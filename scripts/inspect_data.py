@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+﻿#!/usr/bin/env python
 """
 Inspect NASA PCoE .mat file structure and test data parsing.
 
@@ -184,3 +184,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

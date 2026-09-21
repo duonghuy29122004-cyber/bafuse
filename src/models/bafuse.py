@@ -12,7 +12,7 @@ import torch
 import torch.nn as nn
 from typing import Dict, Tuple
 
-from .encoders import DischargeEncoder, EISEncoder, PhysicsEncoder
+from .encoders import DischargeEncoder, EISEncoder, PhysicsEncoder, PhysicsEncoderCNN
 from .fusion import CrossAttentionFusion, WeightedFusion, ConcatFusion
 
 
@@ -29,6 +29,7 @@ class BaFuse(nn.Module):
         latent_dim: int = 64,
         fusion_method: str = "cross_attention",
         fusion_dim: int = 128,
+        physics_encoder_type: str = "mlp",   # Task 3: "mlp" | "cnn1d"
     ):
         """
         Args:
@@ -48,9 +49,16 @@ class BaFuse(nn.Module):
         self.eis_encoder = EISEncoder(
             num_frequencies=eis_num_frequencies, latent_dim=latent_dim
         )
-        self.physics_encoder = PhysicsEncoder(
-            num_physics_features=physics_num_features, latent_dim=latent_dim
-        )
+        # Task 3: choose physics encoder type via flag
+        if physics_encoder_type == "cnn1d":
+            self.physics_encoder = PhysicsEncoderCNN(
+                num_physics_features=physics_num_features, latent_dim=latent_dim
+            )
+        else:
+            self.physics_encoder = PhysicsEncoder(
+                num_physics_features=physics_num_features, latent_dim=latent_dim
+            )
+        self.physics_encoder_type = physics_encoder_type
 
         # --- Fusion ---
         if fusion_method == "cross_attention":
