@@ -1,0 +1,191 @@
+# ════════════════════════════════════════════════════════════════════════════
+# BaFuse v2 Configuration
+# ════════════════════════════════════════════════════════════════════════════
+# Backward-compatible with the original config.yaml.
+# New sections are clearly marked with [v2].
+# Existing run_pipeline.py still works unchanged with configs/config.yaml.
+# BaFuse v2 scripts use this file.
+
+# ── Data Paths ───────────────────────────────────────────────────────────────
+data:
+  # NASA PCoE dataset (original — unchanged)
+  raw_dir:       "5. BatteryDataSet"
+  processed_dir: "data/processed"
+
+  # [v2] Mendeley dataset root directory
+  mendeley_dir:  "Lithium-ion cells EIS dataset with fitting and deg/Lithium-ion cells EIS dataset with fitting and deg"
+  mendeley_processed_dir: "data/mendeley_processed"
+
+# ── Data Processing ──────────────────────────────────────────────────────────
+processing:
+  # NASA split (unchanged from v1)
+  time_tolerance_hours: 24
+  train_ratio:   0.6
+  val_ratio:     0.2
+  test_ratio:    0.2
+  random_state:  42
+  stratify_by_soh: true
+
+  # [v2] Mendeley split — cell-level (8 cells total)
+  mendeley_train_cells: [1, 2, 3, 4, 5]
+  mendeley_val_cells:   [6, 7]
+  mendeley_test_cells:  [8]
+  mendeley_soc_filter:  100   # use only SOC=100% rows (full-charge EIS)
+
+# ── Model Architecture ───────────────────────────────────────────────────────
+model:
+  # ── Encoder input dims (auto-detected at runtime if not set) ──
+  discharge_input_size:  3    # [voltage_v, current_a, temperature_c]
+  eis_num_frequencies:   3    # [impedance, Re, Rct]  (NASA)
+  physics_num_features:  4    # [cycle_age_norm, empirical_fade_prior, voltage_droop, impedance_rise]
+
+  latent_dim:            64
+  fusion_method:         "cross_attention"   # cross_attention | weighted | concat
+  fusion_dim:            128
+  physics_encoder_type:  "mlp"               # mlp | cnn1d
+
+  # [v2] Degradation head
+  deg_hidden_dim:        128
+  deg_dropout:           0.2
+
+# ── Encoders ─────────────────────────────────────────────────────────────────
+encoders:
+  discharge:
+    type:        "lstm"
+    hidden_size: 256
+    num_layers:  3
+    dropout:     0.2
+  eis:
+    type:        "mlp"
+    hidden_size: 128
+    dropout:     0.2
+  physics:
+    type:        "mlp"
+    hidden_sizes: [256, 128]
+    dropout:     0.2
+
+# ── Fusion ───────────────────────────────────────────────────────────────────
+fusion:
+  cross_attention:
+    num_heads: 4
+    dropout:   0.1
+
+# ── Loss Functions ───────────────────────────────────────────────────────────
+loss:
+  # SOH loss (unchanged)
+  base_loss:        "mse"
+  lambda_physics:   0.1
+  lambda_smooth:    0.05
+  lambda_diversity: 0.01
+
+  # [v2] Multi-task weights
+  lambda_soh: 1.0    # weight for SOH loss term
+  lambda_deg: 0.5    # weight for degradation loss term
+
+  # [v2] Degradation loss per-mode weights
+  w_lli: 1.0
+  w_lam: 1.0
+  w_cl:  1.0
+
+# ── Training ─────────────────────────────────────────────────────────────────
+training:
+  batch_size:     32
+  num_epochs:     100
+  learning_rate:  0.0005
+  weight_decay:   1.0e-5
+  optimizer:      "adam"
+  warmup_epochs:  5
+
+  scheduler:
+    type:          "cosine"
+    warmup_epochs: 10
+
+  early_stopping:
+    enabled:   true
+    patience:  15
+    min_delta: 0.001
+
+  num_workers: 0        # set >0 on Linux for multiprocessing
+  pin_memory:  false
+  shuffle:     true
+
+  # [v2] Training mode
+  # "nasa_only"  — original BaFuse, SOH only (backward-compatible)
+  # "staged"     — Stage-1 Mendeley pre-train, then Stage-2/3 joint
+  # "joint"      — both tasks simultaneously from scratch
+  training_mode: "staged"
+
+# ── [v2] Stage-1 Degradation Pre-training ────────────────────────────────────
+degradation_training:
+  num_epochs:      50
+  lr:              0.001
+  weight_decay:    1.0e-5
+  patience:        10
+  min_delta:       0.0001
+  base_loss:       "mse"
+  w_lli:           1.0
+  w_lam:           1.0
+  w_cl:            1.0
+  checkpoint_dir:  "experiments/degradation"
+
+# ── Evaluation ───────────────────────────────────────────────────────────────
+evaluation:
+  metrics:               ["mae", "rmse", "r2", "mape"]
+  per_battery_analysis:  true
+  uncertainty_quantification:
+    enabled:    true
+    mc_samples: 30
+
+# ── [v2] Ablation Study ───────────────────────────────────────────────────────
+ablation:
+  run:         true
+  seed:        42    # fixed seed — same for ALL experiments
+  modalities:  ["discharge", "eis", "physics"]
+  experiments:
+    - id: A1_full
+      discharge: true
+      eis:       true
+      physics:   true
+    - id: A2_no_discharge
+      discharge: false
+      eis:       true
+      physics:   true
+    - id: A3_no_eis
+      discharge: true
+      eis:       false
+      physics:   true
+    - id: A4_no_physics
+      discharge: true
+      eis:       true
+      physics:   false
+    - id: A5_discharge_only
+      discharge: true
+      eis:       false
+      physics:   false
+    - id: A6_eis_only
+      discharge: false
+      eis:       true
+      physics:   false
+    - id: A7_physics_only
+      discharge: false
+      eis:       false
+      physics:   true
+
+# ── [v2] RAG Explanation ──────────────────────────────────────────────────────
+rag:
+  enabled:   true
+  top_k:     2       # mechanisms retrieved per degradation mode
+  threshold: 0.0     # min estimate to trigger retrieval
+
+# ── Output ───────────────────────────────────────────────────────────────────
+output:
+  checkpoint_dir:      "checkpoints"
+  results_dir:         "results"
+  experiments_dir:     "experiments"
+  plots_dir:           "results/plots"
+  dashboard_port:      8501
+
+# ── Hardware ─────────────────────────────────────────────────────────────────
+device:        "cpu"   # "cuda" if GPU available
+deterministic: true
+seed:          42

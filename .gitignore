@@ -57,3 +57,11 @@ bafuse_env/
 logs/
 *.log
 training_log.txt
+
+# Mendeley Excel dataset (large binary files — track data path in config only)
+Lithium-ion cells EIS dataset with fitting and deg/
+
+# Temp verification files
+verify_out.txt
+verify_err.txt
+scripts/_verify_v2.py
