@@ -28,6 +28,11 @@ def _batch_to_device(batch: Dict, device: torch.device) -> Dict:
 
 
 def _compute_metrics(preds: np.ndarray, targets: np.ndarray) -> Dict[str, float]:
+    """
+    Compute MAE, RMSE, R² on raw [0,1] SOH values.
+    MAPE is computed as a percentage (multiply by 100 internally).
+    For reporting: MAE% = mae * 100, RMSE% = rmse * 100.
+    """
     mae = float(np.mean(np.abs(preds - targets)))
     rmse = float(np.sqrt(np.mean((preds - targets) ** 2)))
     ss_res = np.sum((targets - preds) ** 2)
@@ -74,7 +79,7 @@ def evaluate(model, test_loader: DataLoader, device: torch.device) -> Dict:
 
     overall = _compute_metrics(preds, targets)
     logger.info(
-        f"Test results: MAE={overall['mae']:.3f}  RMSE={overall['rmse']:.3f}  "
+        f"Test results: MAE={overall['mae']*100:.2f}%  RMSE={overall['rmse']*100:.2f}%  "
         f"R^2={overall['r2']:.4f}  MAPE={overall['mape']:.2f}%"
     )
 

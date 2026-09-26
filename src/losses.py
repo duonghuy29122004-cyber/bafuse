@@ -47,8 +47,8 @@ class SoHPredictionLoss(nn.Module):
         return loss
 
     def _physics_regularization(self, pred: torch.Tensor) -> torch.Tensor:
-        """Penalise predictions outside [0, 100]."""
-        return (torch.relu(-pred) + torch.relu(pred - 100.0)).mean()
+        """Penalise predictions outside [0, 1] (SOH is normalised to [0,1])."""
+        return (torch.relu(-pred) + torch.relu(pred - 1.0)).mean()
 
     def _smoothness_loss(
         self,

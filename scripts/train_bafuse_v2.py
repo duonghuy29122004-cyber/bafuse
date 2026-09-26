@@ -74,7 +74,7 @@ def main(args):
     from src.visualization import generate_all_plots
     from evaluation.metrics import compute_metrics, compute_per_battery_metrics
 
-    with open(args.config) as f:
+    with open(args.config, encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 
     seed = int(cfg.get("seed", 42))
@@ -193,10 +193,11 @@ def main(args):
                 str(stage1_ckpt),
                 map_location=device_str,
                 discharge_input_size=d_shape[-1],
-                eis_num_frequencies=max(e_shape[-1], mend_eis_dim),
+                eis_num_frequencies=e_shape[-1],
                 physics_num_features=p_shape[-1],
                 latent_dim=m_cfg.get("latent_dim", 64),
                 fusion_dim=m_cfg.get("fusion_dim", 128),
+                mendeley_eis_num_features=mend_eis_dim,
             )
         else:
             logger.warning(
@@ -220,6 +221,7 @@ def main(args):
             fusion_dim=m_cfg.get("fusion_dim", 128),
             physics_encoder_type=m_cfg.get("physics_encoder_type", "mlp"),
             deg_hidden_dim=m_cfg.get("deg_hidden_dim", 128),
+            mendeley_eis_num_features=mend_eis_dim if mend_eis_dim != e_shape[-1] else None,
         )
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -244,12 +246,12 @@ def main(args):
 
     logger.info("=" * 60)
     logger.info("Test Results")
-    logger.info(f"  MAE  : {overall['mae']:.3f}%")
-    logger.info(f"  RMSE : {overall['rmse']:.3f}%")
+    logger.info(f"  MAE  : {overall['mae']*100:.2f}%")
+    logger.info(f"  RMSE : {overall['rmse']*100:.2f}%")
     logger.info(f"  R²   : {overall['r2']:.4f}")
     logger.info("  Per-battery MAE:")
     for bid, m in per_bat.items():
-        logger.info(f"    {bid}: MAE={m['mae']:.3f}%  R²={m['r2']:.4f}")
+        logger.info(f"    {bid}: MAE={m['mae']*100:.2f}%  R²={m['r2']:.4f}")
 
     # Degradation evaluation (if Mendeley was used)
     deg_results = None

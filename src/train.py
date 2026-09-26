@@ -42,7 +42,12 @@ def _batch_to_device(batch: Dict, device: torch.device) -> Dict:
 
 
 def _compute_metrics(preds: np.ndarray, targets: np.ndarray) -> Dict[str, float]:
-    """Compute MAE, RMSE, R^2."""
+    """
+    Compute MAE, RMSE, R² on raw [0,1] SOH values.
+
+    Stored values are on the [0,1] scale.
+    For human-readable % reporting: MAE% = mae * 100, RMSE% = rmse * 100.
+    """
     mae = float(np.mean(np.abs(preds - targets)))
     rmse = float(np.sqrt(np.mean((preds - targets) ** 2)))
     ss_res = np.sum((targets - preds) ** 2)
@@ -259,7 +264,7 @@ def train(
         logger.info(
             f"Epoch {epoch:3d}/{num_epochs}  "
             f"train_loss={train_loss:.4f}  val_loss={val_loss:.4f}  "
-            f"MAE={val_metrics['mae']:.3f}  RMSE={val_metrics['rmse']:.3f}  "
+            f"MAE={val_metrics['mae']*100:.2f}%  RMSE={val_metrics['rmse']*100:.2f}%  "
             f"R^2={val_metrics['r2']:.4f}  "
             f"lr={scheduler.get_last_lr()[0]:.2e}"
         )
@@ -283,7 +288,7 @@ def train(
                 },
                 ckpt_path,
             )
-            logger.info(f"  OK Saved best checkpoint (MAE={current_mae:.3f}%) -> {ckpt_path}")
+            logger.info(f"  OK Saved best checkpoint (MAE={current_mae*100:.2f}%) -> {ckpt_path}")
         else:
             patience_counter += 1
 
@@ -301,8 +306,8 @@ def train(
         bm = best_val_metrics or state.get("val_metrics", {})
         logger.info(
             f"Loaded best checkpoint (epoch {state.get('epoch','?')})  "
-            f"val MAE={bm.get('mae', float('nan')):.3f}%  "
-            f"RMSE={bm.get('rmse', float('nan')):.3f}%  "
+            f"val MAE={bm.get('mae', float('nan'))*100:.2f}%  "
+            f"RMSE={bm.get('rmse', float('nan'))*100:.2f}%  "
             f"R^2={bm.get('r2', float('nan')):.4f}"
         )
         # Patch history so callers read best-epoch values, not last-epoch

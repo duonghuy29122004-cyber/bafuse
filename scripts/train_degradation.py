@@ -61,7 +61,7 @@ def main(args):
     from src.models.bafuse_v2 import BaFuseV2
     from src.training.degradation_trainer import DegradationTrainer
 
-    with open(args.config) as f:
+    with open(args.config, encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 
     seed       = int(cfg.get("seed", 42))

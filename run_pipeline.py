@@ -168,8 +168,8 @@ def main(args):
         device=device_str,
     )
     # BUG FIX: log best-checkpoint metrics, not last-epoch metrics
-    logger.info(f"  best val MAE      : {history['best_val_mae']:.3f}%")
-    logger.info(f"  best val RMSE     : {history['best_val_rmse']:.3f}%")
+    logger.info(f"  best val MAE      : {history['best_val_mae']*100:.2f}%")
+    logger.info(f"  best val RMSE     : {history['best_val_rmse']*100:.2f}%")
     logger.info(f"  best val R^2      : {history['best_val_r2']:.4f}")
 
     # =========================================================
@@ -178,15 +178,15 @@ def main(args):
     logger.info("\nSTEP 7 -- Test set evaluation")
     results = evaluate(trained_model, test_loader, device)
     ov = results["overall"]
-    logger.info(f"  Test MAE          : {ov['mae']:.3f}%")
-    logger.info(f"  Test RMSE         : {ov['rmse']:.3f}%")
+    logger.info(f"  Test MAE          : {ov['mae']*100:.2f}%")
+    logger.info(f"  Test RMSE         : {ov['rmse']*100:.2f}%")
     logger.info(f"  Test R^2          : {ov['r2']:.4f}")
     logger.info(f"  Test MAPE         : {ov['mape']:.2f}%")
 
     # Per-battery
     logger.info("  Per-battery MAE:")
     for bid, m in results["per_battery"].items():
-        logger.info(f"    {bid}: MAE={m['mae']:.3f}%  R^2={m['r2']:.4f}")
+        logger.info(f"    {bid}: MAE={m['mae']*100:.2f}%  R^2={m['r2']:.4f}")
 
     # =========================================================
     # 8. MODALITY CONTRIBUTIONS

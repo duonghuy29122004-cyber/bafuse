@@ -86,39 +86,41 @@ def main(args):
         json.dump(stats, f, indent=2)
 
     # ── 5. Summary ──────────────────────────────────────────────────────────
+    SEP = "=" * 60
     summary_lines = [
-        "═" * 60,
-        "Mendeley EIS Dataset — Preprocessing Summary",
-        "═" * 60,
+        SEP,
+        "Mendeley EIS Dataset - Preprocessing Summary",
+        SEP,
         f"  Source          : {args.mendeley_dir}",
         f"  SOC filter      : {args.soc_filter}%",
         f"  Total samples   : {len(df)}",
         f"  Cells           : {sorted(df['cell_id'].unique().tolist())}",
         f"  Train samples   : {len(train_df)}  cells={sorted(train_df['cell_id'].unique().tolist())}",
-        f"  Val samples     : {len(val_df)}    cells={sorted(val_df['cell_id'].unique().tolist())}",
-        f"  Test samples    : {len(test_df)}   cells={sorted(test_df['cell_id'].unique().tolist())}",
+        f"  Val samples     : {len(val_df)}  cells={sorted(val_df['cell_id'].unique().tolist())}",
+        f"  Test samples    : {len(test_df)}  cells={sorted(test_df['cell_id'].unique().tolist())}",
         "",
         "  Columns         : " + ", ".join(df.columns.tolist()),
         "",
-        "  SOH norm range  : {:.3f} – {:.3f}".format(
+        "  SOH norm range  : {:.3f} - {:.3f}".format(
             float(df["soh_norm"].min()), float(df["soh_norm"].max())),
-        "  LLI range (%)   : {:.2f} – {:.2f}".format(
+        ("  LLI range (%)   : {:.2f} - {:.2f}".format(
             float(df["lli_pct"].min()),  float(df["lli_pct"].max()))
-            if "lli_pct" in df.columns else "  LLI : not available",
-        "  LAM range (%)   : {:.2f} – {:.2f}".format(
+            if "lli_pct" in df.columns else "  LLI : not available"),
+        ("  LAM range (%)   : {:.2f} - {:.2f}".format(
             float(df["lam_pct"].min()),  float(df["lam_pct"].max()))
-            if "lam_pct" in df.columns else "  LAM : not available",
-        "  CL  range (%)   : {:.2f} – {:.2f}".format(
+            if "lam_pct" in df.columns else "  LAM : not available"),
+        ("  CL  range (%)   : {:.2f} - {:.2f}".format(
             float(df["cl_pct"].min()),   float(df["cl_pct"].max()))
-            if "cl_pct"  in df.columns else "  CL  : not available",
+            if "cl_pct"  in df.columns else "  CL  : not available"),
         "",
         "IMPORTANT: LLI/LAM/CL values are model-derived degradation-mode",
         "estimates from ECM fitting. They are NOT physical ground truth.",
-        "═" * 60,
+        SEP,
     ]
     summary = "\n".join(summary_lines)
-    print(summary)
-    with open(out_dir / "mendeley_summary.txt", "w") as f:
+    # Print safely — replace unmappable chars on Windows cp1252 terminals
+    print(summary.encode("ascii", errors="replace").decode("ascii"))
+    with open(out_dir / "mendeley_summary.txt", "w", encoding="utf-8") as f:
         f.write(summary)
 
     logger.info(f"Mendeley preprocessing complete. Output → {out_dir}")
