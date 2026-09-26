@@ -66,6 +66,19 @@ def _safe_impedance_scalar(arr: np.ndarray) -> Tuple[float, float, float]:
     4. Apply soft percentile clip (1st–99th) to remove remaining outliers.
     5. Return median magnitude, median Re part, and median |Im| part as Rct proxy.
 
+    P4-#10 NOTE — ENGINEERED PROXY FEATURES:
+        Re_median  is the median of Re(Z) across all measured frequencies.
+                   This is NOT the same as the true electrolyte/ohmic resistance
+                   R0, which is conventionally read at the high-frequency
+                   real-axis intercept of the Nyquist plot (or from ECM fitting).
+        Rct_proxy  is the median of |Im(Z)| across all frequencies.
+                   This is NOT the charge-transfer resistance Rct, which is
+                   the diameter of the first semicircle in the Nyquist plot.
+        Both values are useful engineered features that correlate with true
+        Re/Rct over aging, but should not be interpreted as physically exact
+        impedance spectroscopy quantities. They are analogous to the
+        "model-derived" label convention used for Mendeley LLI/LAM/CL.
+
     Returns:
         (imp_median, re_median, rct_proxy)  — all float, NaN if no valid data.
     """
@@ -183,14 +196,27 @@ def parse_discharge_curve(mat_data: dict, battery_id: str) -> pd.DataFrame:
             temperature = temperature[:min_len]
             time_data   = time_data[:min_len]
 
-            # Cycle capacity
-            if len(capacity_ts) >= min_len:
-                capacity_ts   = capacity_ts[:min_len]
+            # P1-FIX #1: use Capacity field directly if ANY value is present.
+            # The NASA .mat Capacity field is typically a scalar or very short
+            # array — NOT the same length as voltage/current (min_len).
+            # Old condition `len(capacity_ts) >= min_len` was almost always
+            # False → silently fell through to coulomb-counting every time.
+            # New logic: if capacity_ts has ANY value, use max(abs) directly.
+            # Only fall back to coulomb-counting when the field is truly absent.
+            _used_capacity_field = False
+            if len(capacity_ts) > 0:
                 cycle_capacity = float(np.nanmax(np.abs(capacity_ts)))
+                _used_capacity_field = True
             else:
+                # Fallback: coulomb-counting from current × time
                 dt = np.diff(time_data, prepend=time_data[0])
                 charge = np.abs(current) * dt / 3600.0
                 cycle_capacity = float(np.nansum(charge))
+                logger.warning(
+                    f"  [coulomb-count fallback] {battery_id} cycle {cycle_idx}: "
+                    f"no Capacity field found, using current integration "
+                    f"(cycle_capacity={cycle_capacity:.4f} Ah)"
+                )
 
             for i in range(min_len):
                 discharge_records.append({
@@ -201,6 +227,9 @@ def parse_discharge_curve(mat_data: dict, battery_id: str) -> pd.DataFrame:
                     'temperature_c': float(temperature[i]),
                     'time_s':        float(time_data[i]),
                     'capacity_ahr':  cycle_capacity,
+                    # P1-FIX: track whether capacity came from the .mat field
+                    # (True) or from coulomb-counting fallback (False).
+                    '_cap_from_field': _used_capacity_field,
                 })
 
         except Exception as e:
@@ -209,7 +238,25 @@ def parse_discharge_curve(mat_data: dict, battery_id: str) -> pd.DataFrame:
 
     df = pd.DataFrame(discharge_records)
     num_cycles = df['cycle_idx'].nunique() if not df.empty else 0
-    logger.info(f"{battery_id}: Parsed {len(df)} discharge records from {num_cycles} cycles")
+
+    # P1-FIX: report capacity-source breakdown
+    if not df.empty and '_cap_from_field' in df.columns:
+        n_field    = df.drop_duplicates('cycle_idx')['_cap_from_field'].sum()
+        n_total    = df['cycle_idx'].nunique()
+        n_fallback = n_total - n_field
+        pct_field  = 100.0 * n_field / max(n_total, 1)
+        if n_fallback > 0:
+            logger.warning(
+                f"{battery_id}: {n_field}/{n_total} cycles used .mat Capacity field "
+                f"({pct_field:.0f}%), {n_fallback} used coulomb-counting fallback"
+            )
+        else:
+            logger.info(
+                f"{battery_id}: Parsed {len(df)} discharge records from {num_cycles} cycles "
+                f"[100% capacity from .mat field]"
+            )
+    else:
+        logger.info(f"{battery_id}: Parsed {len(df)} discharge records from {num_cycles} cycles")
     return df
 
 
@@ -353,6 +400,19 @@ def parse_all_mat_files(raw_data_dir: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
 
     discharge_combined = pd.concat(all_discharge, ignore_index=True) if all_discharge else pd.DataFrame()
     eis_combined       = pd.concat(all_eis,       ignore_index=True) if all_eis       else pd.DataFrame()
+
+    # P1-FIX: print dataset-wide capacity-source breakdown
+    if not discharge_combined.empty and '_cap_from_field' in discharge_combined.columns:
+        per_cycle = discharge_combined.drop_duplicates(['battery_id', 'cycle_idx'])
+        n_total   = len(per_cycle)
+        n_field   = int(per_cycle['_cap_from_field'].sum())
+        n_fallback = n_total - n_field
+        pct_field  = 100.0 * n_field / max(n_total, 1)
+        logger.info(
+            f"CAPACITY SOURCE SUMMARY — {n_field}/{n_total} discharge cycles "
+            f"({pct_field:.1f}%) used .mat Capacity field; "
+            f"{n_fallback} ({100-pct_field:.1f}%) used coulomb-counting fallback"
+        )
 
     logger.info(
         f"Total (deduplicated): {len(discharge_combined):,} discharge "

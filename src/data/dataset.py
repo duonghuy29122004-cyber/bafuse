@@ -3,17 +3,20 @@ PyTorch Dataset and DataLoader for BaFuse.
 
 Fixes applied:
 - BUG 5: Resample discharge curves to TARGET_SEQ_LEN=100 via np.interp (~4x speedup).
-- BUG 1: Removed capacity_fade from physics features (was a direct linear function of
-         the SoH label → data leakage). Replaced with an empirical aging prior
-         (power-law capacity fade estimate from cycle age alone, independent of the
-         actual measured capacity of the sample).
-         Physics features are now 3D:
-           [cycle_age_norm, voltage_droop, impedance_rise_norm]
-         Plus optional empirical prior (total 4D if INCLUDE_EMPIRICAL_PRIOR=True):
-           [cycle_age_norm, empirical_fade_prior, voltage_droop, impedance_rise_norm]
+- BUG 1: Removed capacity_fade from physics features (data leakage). Replaced with
+         empirical aging prior (power-law, cycle-age only, no per-sample capacity).
 - BUG 2: BaFuseDataset accepts external_stats so val/test are normalised with
-         train statistics. create_dataloaders passes train_dataset.stats to
-         val/test datasets automatically.
+         train statistics. create_dataloaders passes train_dataset.stats automatically.
+- P1-#2: Added BATTERY_NOMINAL_CAPACITY dict (per-campaign from NASA PCoE READMEs).
+         SOH = capacity_ahr / nominal_capacity(battery_id) — no more hardcoded /2.0.
+         fit_aging_prior also uses per-cell nominal capacity for correct SOH [0,1].
+- P2-#3: Time-series discharge channels (voltage/current/temp) are now z-score
+         normalised before being returned, matching the aggregate fallback path.
+- P2-#4: re_ohm and rct_ohm are now normalised via dedicated stats computed at
+         train time. Stats dict keys: 're' and 'rct'.
+- P2-#5: If discharge_data_df is provided, __init__ pre-filters data_df to rows
+         that actually have matching time-series. Missing rows are logged and dropped
+         at construction time to prevent silent shape mixing at collate.
 """
 
 import torch
@@ -69,6 +72,34 @@ BATTERY_CUTOFF_VOLTAGE: Dict[str, float] = {
     "B0053": 2.0, "B0054": 2.2, "B0055": 2.5, "B0056": 2.7,
 }
 
+# ── Per-battery nominal (rated) capacity from NASA PCoE README files ────────
+# All Campaign 1-6 cells are 18650-type Li-ion, rated 2.0 Ah by NASA PCoE.
+# Source: README files in each BatteryAgingARC-* subdirectory.
+# If a future campaign uses a different cell chemistry/format, add it here.
+BATTERY_NOMINAL_CAPACITY: Dict[str, float] = {
+    # Campaign 1 — BatteryAgingARC-FY08Q4 (2.0 Ah rated)
+    "B0005": 2.0, "B0006": 2.0, "B0007": 2.0, "B0018": 2.0,
+    # Campaign 2 — BatteryAgingARC_25_26_27_28_P1 (2.0 Ah rated)
+    "B0025": 2.0, "B0026": 2.0, "B0027": 2.0, "B0028": 2.0,
+    # Campaign 3 — BatteryAgingARC_25-44 (2.0 Ah rated)
+    "B0029": 2.0, "B0030": 2.0, "B0031": 2.0, "B0032": 2.0,
+    "B0033": 2.0, "B0034": 2.0, "B0036": 2.0,
+    "B0038": 2.0, "B0039": 2.0, "B0040": 2.0,
+    "B0041": 2.0, "B0042": 2.0, "B0043": 2.0, "B0044": 2.0,
+    # Campaign 4 — BatteryAgingARC_45_46_47_48 (2.0 Ah rated)
+    "B0045": 2.0, "B0046": 2.0, "B0047": 2.0, "B0048": 2.0,
+    # Campaign 5 — BatteryAgingARC_49_50_51_52 (2.0 Ah rated)
+    "B0049": 2.0, "B0050": 2.0, "B0051": 2.0, "B0052": 2.0,
+    # Campaign 6 — BatteryAgingARC_53_54_55_56 (2.0 Ah rated)
+    "B0053": 2.0, "B0054": 2.0, "B0055": 2.0, "B0056": 2.0,
+}
+_DEFAULT_NOMINAL_CAPACITY = 2.0  # fallback if battery_id not in dict
+
+
+def get_nominal_capacity(battery_id: str) -> float:
+    """Return rated nominal capacity (Ah) for battery_id. Falls back to 2.0 Ah."""
+    return BATTERY_NOMINAL_CAPACITY.get(str(battery_id), _DEFAULT_NOMINAL_CAPACITY)
+
 
 def fit_aging_prior(train_df: pd.DataFrame) -> dict:
     """
@@ -85,12 +116,16 @@ def fit_aging_prior(train_df: pd.DataFrame) -> dict:
     Returns:
         dict with keys: A, b, N_ref  (power-law parameters)
     """
-    # Compute mean SoH per (battery, discharge_cycle)
+    # P1-#2: use per-battery nominal capacity for SOH in [0,1].
+    # Previously hardcoded /2.0 — now looks up BATTERY_NOMINAL_CAPACITY per row.
     ages = train_df["discharge_cycle"].values.astype(float)
-    sohs = (train_df["capacity_ahr"] / 2.0 * 100.0).clip(1, 100).values
+    nominal = train_df["battery_id"].map(
+        lambda bid: get_nominal_capacity(bid)
+    ).values.astype(float)
+    sohs = np.clip(train_df["capacity_ahr"].values / nominal, 0.01, 1.0)
 
-    # Fade fraction = (100 - SoH) / 100
-    fade = (100.0 - sohs) / 100.0
+    # Fade fraction = 1 - SOH  (already in [0,1] range)
+    fade = (1.0 - sohs)
     fade = np.clip(fade, 1e-4, 0.99)
 
     N_ref = float(np.percentile(ages, 90)) if len(ages) > 10 else 168.0
@@ -148,26 +183,55 @@ class BaFuseDataset(Dataset):
         normalize: bool = True,
         max_seq_len: int = TARGET_SEQ_LEN,
         device: str = 'cpu',
-        external_stats: Optional[Dict] = None,      # BUG 2: accept train stats
-        aging_prior_params: Optional[Dict] = None,  # P3: fitted aging prior
+        external_stats: Optional[Dict] = None,
+        aging_prior_params: Optional[Dict] = None,
     ):
         """
         Args:
             data_df            : Paired discharge-EIS DataFrame.
             discharge_data_df  : Full time-series discharge DataFrame (optional).
+                                 P2-#5: If provided, data_df rows whose
+                                 (battery_id, cycle_idx) are absent in
+                                 discharge_data_df are silently dropped at
+                                 construction time so all samples in this
+                                 Dataset have the same (TARGET_SEQ_LEN, 3) shape.
             normalize          : Whether to z-score features.
             max_seq_len        : Resampled sequence length.
             device             : Torch device string.
-            external_stats     : BUG 2 — train-set mean/std for val/test normalization.
-            aging_prior_params : P3 — power-law params {A, b, N_ref} fit on train pop.
+            external_stats     : Train-set mean/std for val/test normalization.
+            aging_prior_params : Power-law params {A, b, N_ref} fit on train pop.
         """
-        self.data_df           = data_df.reset_index(drop=True)
         self.discharge_data_df = discharge_data_df
         self.normalize         = normalize
         self.max_seq_len       = max_seq_len
         self.device            = device
 
-        # P3: aging prior (fallback to defaults if not provided)
+        # P2-#5: Pre-filter data_df when discharge_data_df is provided.
+        # This prevents silent shape mixing in DataLoader.collate_fn.
+        if discharge_data_df is not None and not discharge_data_df.empty:
+            available = set(
+                zip(discharge_data_df["battery_id"], discharge_data_df["cycle_idx"])
+            )
+            mask = data_df.apply(
+                lambda r: (r["battery_id"], r["discharge_cycle"]) in available,
+                axis=1,
+            )
+            n_before = len(data_df)
+            data_df  = data_df[mask].reset_index(drop=True)
+            n_dropped = n_before - len(data_df)
+            if n_dropped > 0:
+                logger.warning(
+                    f"P2-#5: Dropped {n_dropped}/{n_before} rows from data_df "
+                    f"because their (battery_id, discharge_cycle) pairs were not "
+                    f"found in discharge_data_df. All remaining samples will use "
+                    f"time-series shape ({max_seq_len}, 3)."
+                )
+            else:
+                logger.debug(
+                    f"P2-#5: All {n_before} data_df rows have matching time-series."
+                )
+
+        self.data_df      = data_df.reset_index(drop=True)
         self.aging_params = aging_prior_params if aging_prior_params is not None else {
             "A": _FALLBACK_AGING_A, "b": _FALLBACK_AGING_B, "N_ref": _FALLBACK_AGING_N_REF
         }
@@ -182,28 +246,28 @@ class BaFuseDataset(Dataset):
     # ── normalization ───────────────────────────────────────────────────────
 
     def _compute_normalization_stats(self):
-        """Compute mean/std from this dataset's own data_df (train only)."""
+        """
+        Compute mean/std from this dataset's own data_df (train only).
+
+        P2-#4: Added 're' and 'rct' stats so re_ohm and rct_ohm are
+        normalised consistently with impedance_ohm in __getitem__.
+        """
+        def _safe_stat(col: str) -> Dict[str, float]:
+            vals = self.data_df[col].dropna().values.astype(float)
+            return {
+                "mean": float(np.mean(vals)) if len(vals) else 0.0,
+                "std":  float(np.std(vals))  + 1e-8,
+            }
+
         self.stats = {
-            'voltage': {
-                'mean': float(self.data_df['voltage_mean'].mean()),
-                'std':  float(self.data_df['voltage_mean'].std()) + 1e-8,
-            },
-            'current': {
-                'mean': float(self.data_df['current_mean'].mean()),
-                'std':  float(self.data_df['current_mean'].std()) + 1e-8,
-            },
-            'temperature': {
-                'mean': float(self.data_df['temp_mean'].mean()),
-                'std':  float(self.data_df['temp_mean'].std()) + 1e-8,
-            },
-            'impedance': {
-                'mean': float(self.data_df['impedance_ohm'].mean()),
-                'std':  float(self.data_df['impedance_ohm'].std()) + 1e-8,
-            },
-            'capacity': {
-                'mean': float(self.data_df['capacity_ahr'].mean()),
-                'std':  float(self.data_df['capacity_ahr'].std()) + 1e-8,
-            },
+            'voltage':     _safe_stat('voltage_mean'),
+            'current':     _safe_stat('current_mean'),
+            'temperature': _safe_stat('temp_mean'),
+            'impedance':   _safe_stat('impedance_ohm'),
+            'capacity':    _safe_stat('capacity_ahr'),
+            # P2-#4: EIS sub-components
+            're':          _safe_stat('re_ohm'),
+            'rct':         _safe_stat('rct_ohm'),
         }
         logger.info("Normalization stats computed from training data")
 
@@ -240,6 +304,10 @@ class BaFuseDataset(Dataset):
         capacity_ahr   = row['capacity_ahr']
 
         # ── DISCHARGE ──────────────────────────────────────────────────────
+        # Aggregate fallback (5 features, shape=(5,)) — used when no time-series
+        # data is available. After P2-#5 __init__ pre-filter, if discharge_data_df
+        # was provided the ts branch below will always succeed; the fallback is
+        # only reached when discharge_data_df=None.
         discharge_features = np.array([
             self._normalize(row['voltage_mean'], 'voltage'),
             self._normalize(row['current_mean'], 'current'),
@@ -255,31 +323,50 @@ class BaFuseDataset(Dataset):
             ]
             if not ts_df.empty:
                 ts_raw = ts_df[['voltage_v', 'current_a', 'temperature_c']].values
-                discharge_features = self._resample_sequence(ts_raw, self.max_seq_len)
+
+                # P2-#3: z-score each channel using train-set stats BEFORE
+                # resampling. Normalise column-by-column with matching stat keys.
+                if self.normalize:
+                    v_mean = self.stats['voltage']['mean']
+                    v_std  = self.stats['voltage']['std']
+                    c_mean = self.stats['current']['mean']
+                    c_std  = self.stats['current']['std']
+                    t_mean = self.stats['temperature']['mean']
+                    t_std  = self.stats['temperature']['std']
+
+                    ts_norm = ts_raw.copy().astype(np.float64)
+                    ts_norm[:, 0] = (ts_norm[:, 0] - v_mean) / v_std   # voltage
+                    ts_norm[:, 1] = (ts_norm[:, 1] - c_mean) / c_std   # current
+                    ts_norm[:, 2] = (ts_norm[:, 2] - t_mean) / t_std   # temperature
+                    ts_raw = ts_norm
+
+                discharge_features = self._resample_sequence(
+                    ts_raw.astype(np.float32), self.max_seq_len
+                )
 
         discharge_tensor = torch.from_numpy(discharge_features.astype(np.float32))
 
         # ── EIS ────────────────────────────────────────────────────────────
+        # P2-#4: normalise all three EIS features. re_ohm / rct_ohm use their
+        # own stats ('re', 'rct') computed at train time; missing values → 0.0
+        # (the mean before normalisation, so NaN→0 after z-score is correct).
+        def _eis_val(col: str, stat_key: str) -> float:
+            raw = row.get(col, None)
+            val = float(raw) if (raw is not None and pd.notna(raw)) else 0.0
+            return self._normalize(val, stat_key) if self.normalize else val
+
         eis_features = np.array([
             self._normalize(row['impedance_ohm'], 'impedance'),
-            float(row['re_ohm'])  if pd.notna(row['re_ohm'])  else 0.0,
-            float(row['rct_ohm']) if pd.notna(row['rct_ohm']) else 0.0,
+            _eis_val('re_ohm',  're'),
+            _eis_val('rct_ohm', 'rct'),
         ], dtype=np.float32)
         eis_tensor = torch.from_numpy(eis_features)
 
         # ── PHYSICS (leak-free, population-level prior) ────────────────────
-        # [cycle_age_norm, empirical_fade_prior, voltage_droop, impedance_rise]
-        # empirical_fade_prior uses fitted power-law from train population — NOT per-sample cap
         cycle_age      = float(discharge_cycle)
         cycle_age_norm = cycle_age / self.aging_params.get("N_ref", _FALLBACK_AGING_N_REF)
-        # Task 1 FIX: use per-battery cutoff voltage, not hardcoded 2.7 V
-        # voltage_droop measures how much voltage_min deviates FROM the cutoff —
-        # for a healthy battery this ≈ 0 (hits cutoff cleanly); as battery ages
-        # the curve sagging means it hits cutoff earlier → droop becomes more negative.
-        # With a fixed 2.7 V reference, batteries with cutoff=2.0 V (e.g. B0053)
-        # always show apparent "droop" even when healthy — confounds the feature.
         cutoff_v       = get_cutoff_voltage(battery_id)
-        voltage_range  = max(4.2 - cutoff_v, 0.1)   # full discharge window width
+        voltage_range  = max(4.2 - cutoff_v, 0.1)
         voltage_droop  = (row['voltage_min'] - cutoff_v) / voltage_range
         impedance_rise = (
             (row['impedance_ohm'] - self.stats['impedance']['mean'])
@@ -293,12 +380,15 @@ class BaFuseDataset(Dataset):
             voltage_droop,
             impedance_rise,
         ], dtype=np.float32)
-
         physics_tensor = torch.from_numpy(physics_features)
 
-        # ── SOH LABEL ──────────────────────────────────────────────────────
-        soh_label = float(np.clip((capacity_ahr / 2.0) * 100.0, 0.0, 100.0))
-        soh_tensor = torch.tensor(soh_label, dtype=torch.float32)
+        # ── SOH LABEL — normalised to [0, 1] ──────────────────────────────
+        # P1-#2: use per-battery nominal capacity, not hardcoded 2.0 Ah.
+        # SOH = capacity_ahr / nominal_capacity(battery_id).
+        # Reported metrics: MAE% = MAE*100, RMSE% = RMSE*100.
+        nominal_cap = get_nominal_capacity(battery_id)
+        soh_label   = float(np.clip(capacity_ahr / nominal_cap, 0.0, 1.0))
+        soh_tensor  = torch.tensor(soh_label, dtype=torch.float32)
 
         return {
             'discharge':  discharge_tensor,

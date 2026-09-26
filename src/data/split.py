@@ -59,14 +59,26 @@ def split_by_battery(
     
     if stratify_by_soh:
         # Compute capacity deciles for stratification
-        battery_soh['capacity_bin'] = pd.qcut(
-            battery_soh['mean_capacity'],
-            q=3,  # 3 bins: low, medium, high capacity loss
-            labels=['high_loss', 'medium_loss', 'low_loss'],
-            duplicates='drop'
-        )
-        strata = battery_soh['capacity_bin'].values
-        logger.info(f"Stratified by capacity ranges: {pd.Series(strata).value_counts().to_dict()}")
+        # Guard: sklearn requires each stratum to have ≥ 2 members.
+        # With very few batteries this can fail → fall back to no stratification.
+        try:
+            battery_soh['capacity_bin'] = pd.qcut(
+                battery_soh['mean_capacity'],
+                q=3,  # 3 bins: low, medium, high capacity loss
+                labels=['high_loss', 'medium_loss', 'low_loss'],
+                duplicates='drop'
+            )
+            strata = battery_soh['capacity_bin'].values
+            # Verify every stratum has ≥ 2 members (sklearn requirement)
+            bin_counts = pd.Series(strata).value_counts()
+            if bin_counts.min() < 2:
+                raise ValueError(
+                    f"Stratum too small: {bin_counts.to_dict()} — disabling stratification"
+                )
+            logger.info(f"Stratified by capacity ranges: {bin_counts.to_dict()}")
+        except Exception as e:
+            logger.warning(f"Stratification disabled ({e}); using random split instead.")
+            strata = None
     else:
         strata = None
     
@@ -78,13 +90,32 @@ def split_by_battery(
         random_state=random_state,
         stratify=strata if stratify_by_soh else None
     )
-    
-    # Second: split (val+test) into val and test
+
+    # P3-#9 FIX: also stratify the val/test split.
     val_ratio_of_temp = val_ratio / (val_ratio + test_ratio)
+    if stratify_by_soh and len(temp_batteries) >= 4:
+        temp_soh  = battery_soh[battery_soh['battery_id'].isin(temp_batteries)].copy()
+        try:
+            temp_soh['capacity_bin'] = pd.qcut(
+                temp_soh['mean_capacity'],
+                q=min(3, len(temp_soh)),
+                labels=False,
+                duplicates='drop',
+            )
+            temp_strata = temp_soh.set_index('battery_id').loc[temp_batteries, 'capacity_bin'].values
+            # Require ≥ 2 per stratum
+            if pd.Series(temp_strata).value_counts().min() < 2:
+                raise ValueError("temp stratum too small")
+        except Exception:
+            temp_strata = None
+    else:
+        temp_strata = None
+
     val_batteries, test_batteries = train_test_split(
         temp_batteries,
         train_size=val_ratio_of_temp,
-        random_state=random_state
+        random_state=random_state,
+        stratify=temp_strata,
     )
     
     # Filter data by battery assignment

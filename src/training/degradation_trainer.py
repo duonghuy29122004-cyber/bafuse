@@ -118,10 +118,17 @@ class DegradationTrainer:
     # -----------------------------------------------------------------------
 
     def _freeze_non_deg_params(self):
-        """Freeze everything except EIS encoder and EIS-only degradation head."""
+        """
+        Freeze everything except mendeley_eis_encoder and degradation_head_eis_only.
+
+        P3-#7 FIX: was 'eis_encoder in name' (substring), which also matched the
+        NASA eis_encoder.* parameters unintentionally. Now uses startswith()
+        exact-prefix match so only the Mendeley-specific encoder is kept trainable.
+        """
         frozen, trainable = 0, 0
         for name, param in self.model.named_parameters():
-            if "eis_encoder" in name or "degradation_head_eis_only" in name:
+            if (name.startswith("mendeley_eis_encoder.")
+                    or name.startswith("degradation_head_eis_only.")):
                 param.requires_grad = True
                 trainable += param.numel()
             else:
@@ -129,7 +136,7 @@ class DegradationTrainer:
                 frozen += param.numel()
         logger.info(
             f"Stage-1 freeze: {trainable:,} trainable params "
-            f"(EIS encoder + deg head), {frozen:,} frozen"
+            f"(mendeley_eis_encoder + degradation_head_eis_only), {frozen:,} frozen"
         )
 
     def unfreeze_all(self):

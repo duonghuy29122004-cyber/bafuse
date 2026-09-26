@@ -21,8 +21,15 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# BUG 2: Physical lower bound for valid cycle capacity
-MIN_CAPACITY_AHR = 0.5   # Ahr  (~25% of 2 Ahr nominal; below this is a fault)
+# P1-#2: Minimum valid cycle capacity expressed as a FRACTION of each battery's
+# nominal capacity, not a fixed absolute threshold.
+# 0.25 × 2.0 Ah = 0.50 Ah for standard NASA cells (same effective floor as before),
+# but correctly scales if a different nominal capacity is used.
+_MIN_CAPACITY_FRACTION = 0.25
+
+# Keep the old constant name as a fallback used in the absolute-threshold path
+# (only active when battery_id is not in BATTERY_NOMINAL_CAPACITY).
+MIN_CAPACITY_AHR = 0.5   # Ahr legacy default — kept for backward compat imports
 
 
 def pair_discharge_eis(
@@ -44,39 +51,53 @@ def pair_discharge_eis(
         Cleaned, paired DataFrame.
     """
 
-    # ── BUG 2: drop low-capacity cycles before aggregation ──────────────────
+    # ── P1-#2 / BUG 2: drop low-capacity cycles using per-battery relative threshold ──
     if 'capacity_ahr' in discharge_df.columns:
         before = discharge_df['cycle_idx'].nunique() if not discharge_df.empty else 0
-        # flag bad cycles (capacity too low)
-        bad_cycles = (
+
+        # Import here to avoid circular dependency at module level
+        from src.data.dataset import get_nominal_capacity  # noqa: PLC0415
+
+        # Compute per-cycle capacity and the per-battery threshold
+        cycle_caps = (
             discharge_df.groupby(['battery_id', 'cycle_idx'])['capacity_ahr']
             .first()
             .reset_index()
         )
-        bad_cycles = bad_cycles[bad_cycles['capacity_ahr'] < MIN_CAPACITY_AHR]
+        cycle_caps['min_cap'] = cycle_caps['battery_id'].map(
+            lambda bid: _MIN_CAPACITY_FRACTION * get_nominal_capacity(bid)
+        )
+        bad_cycles = cycle_caps[cycle_caps['capacity_ahr'] < cycle_caps['min_cap']]
 
         if not bad_cycles.empty:
-            # build a set of (battery_id, cycle_idx) to drop
-            bad_set = set(zip(bad_cycles['battery_id'], bad_cycles['cycle_idx']))
-            mask = discharge_df.apply(
-                lambda r: (r['battery_id'], r['cycle_idx']) not in bad_set, axis=1
+            # Vectorised filter — replaces the slow apply(lambda) from before
+            # P4-#14 FIX: use index-based merge instead of per-row Python call
+            bad_idx = pd.MultiIndex.from_arrays(
+                [bad_cycles['battery_id'], bad_cycles['cycle_idx']]
             )
-            discharge_df = discharge_df[mask].copy()
+            df_idx  = pd.MultiIndex.from_arrays(
+                [discharge_df['battery_id'], discharge_df['cycle_idx']]
+            )
+            discharge_df = discharge_df[~df_idx.isin(bad_idx)].copy()
             after = discharge_df['cycle_idx'].nunique() if not discharge_df.empty else 0
 
-            # log per battery
             for bid, grp in bad_cycles.groupby('battery_id'):
+                threshold = grp['min_cap'].iloc[0]
                 logger.info(
-                    f"  [BUG2 filter] {bid}: dropped {len(grp)} low-capacity cycles "
-                    f"(capacity < {MIN_CAPACITY_AHR} Ahr) — "
-                    f"cycles: {sorted(grp['cycle_idx'].tolist())}"
+                    f"  [cap filter] {bid}: dropped {len(grp)} cycles with "
+                    f"capacity < {threshold:.3f} Ah "
+                    f"({_MIN_CAPACITY_FRACTION*100:.0f}% of nominal)"
+                    f" — cycles: {sorted(grp['cycle_idx'].tolist())}"
                 )
             logger.info(
-                f"  [BUG2 filter] Total cycles removed: {before - after} "
-                f"({len(bad_cycles)} cycles across {bad_cycles['battery_id'].nunique()} batteries)"
+                f"  [cap filter] Total removed: {before - after} cycles "
+                f"across {bad_cycles['battery_id'].nunique()} batteries"
             )
         else:
-            logger.info(f"  [BUG2 filter] No low-capacity cycles found (threshold={MIN_CAPACITY_AHR} Ahr)")
+            logger.info(
+                f"  [cap filter] No low-capacity cycles found "
+                f"(threshold={_MIN_CAPACITY_FRACTION*100:.0f}% nominal)"
+            )
 
     # ── Aggregate discharge per cycle ───────────────────────────────────────
     agg_dict = {

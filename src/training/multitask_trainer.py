@@ -175,63 +175,99 @@ class MultiTaskTrainer:
         """
         One training epoch.
 
-        NASA batches → SOH objective.
-        Mendeley batches → degradation objective (if loader provided).
+        Training mode determines how NASA and Mendeley batches are combined:
+
+        "nasa_only":
+            Only NASA batches are used. One backward pass per NASA batch.
+            L = lambda_soh * L_soh
+
+        "staged" / "joint" (P3-#6 FIX — true interleaved joint loss):
+            NASA and Mendeley batches are *interleaved* step-by-step using
+            itertools.cycle to repeat the shorter loader.
+            At each step both losses are computed if both batches are available,
+            then a SINGLE backward() + optimizer.step() fires:
+            L = lambda_soh * L_soh + lambda_deg * L_deg
+            This prevents gradient competition between tasks that arises when the
+            two loaders are run sequentially (which was the previous bug).
+            If one loader is exhausted, only the available task contributes.
         """
+        import itertools
+
         self.model.train()
         total_soh_loss = 0.0
         total_deg_loss = 0.0
-        n_nasa     = 0
-        n_mendeley = 0
+        n_steps = 0
 
-        # ---- NASA batches (Task A) -----------------------------------------
-        for batch in nasa_loader:
-            batch = _to_device(batch, self.device)
-            self.optimizer.zero_grad()
-
-            out = self.model(
-                batch["discharge"], batch["eis"], batch["physics"]
-            )
-            soh_loss = self.soh_criterion(
-                out["soh_pred"],
-                batch["soh_label"],
-                cycle_age=batch.get("cycle_idx"),
-                battery_ids=batch.get("battery_id"),
-            )
-            loss = self.lambda_soh * soh_loss
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-            self.optimizer.step()
-
-            total_soh_loss += soh_loss.item()
-            n_nasa += 1
-
-        # ---- Mendeley batches (Task B, optional) ---------------------------
-        if mendeley_loader is not None and self.training_mode in ("joint", "staged"):
-            for batch in mendeley_loader:
+        if mendeley_loader is None or self.training_mode == "nasa_only":
+            # ---- NASA-only path (unchanged behaviour) ----------------------
+            for batch in nasa_loader:
                 batch = _to_device(batch, self.device)
                 self.optimizer.zero_grad()
-
-                out = self.model.forward_eis_only(batch["eis"])
-                deg_loss = self.deg_criterion(
-                    lli_pred=out["lli_pred"],
-                    lam_pred=out["lam_pred"],
-                    cl_pred=out["cl_pred"],
-                    lli_target=batch["lli_label"],
-                    lam_target=batch["lam_label"],
-                    cl_target=batch["cl_label"],
+                out = self.model(batch["discharge"], batch["eis"], batch["physics"])
+                soh_loss = self.soh_criterion(
+                    out["soh_pred"],
+                    batch["soh_label"],
+                    cycle_age=batch.get("cycle_idx"),
+                    battery_ids=batch.get("battery_id"),
                 )
-                loss = self.lambda_deg * deg_loss
-                loss.backward()
+                (self.lambda_soh * soh_loss).backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                self.optimizer.step()
+                total_soh_loss += soh_loss.item()
+                n_steps += 1
+        else:
+            # ---- Interleaved joint path ("staged" / "joint") ----------------
+            # Cycle the shorter loader so both are exhausted at the same rate.
+            n_nasa     = len(nasa_loader)
+            n_mendeley = len(mendeley_loader)
+            n_total    = max(n_nasa, n_mendeley)
+
+            nasa_iter  = itertools.cycle(nasa_loader)
+            mend_iter  = itertools.cycle(mendeley_loader)
+
+            for _ in range(n_total):
+                nasa_batch = _to_device(next(nasa_iter),  self.device)
+                mend_batch = _to_device(next(mend_iter),  self.device)
+
+                self.optimizer.zero_grad()
+
+                # SOH loss from NASA batch
+                nasa_out  = self.model(
+                    nasa_batch["discharge"],
+                    nasa_batch["eis"],
+                    nasa_batch["physics"],
+                )
+                soh_loss = self.soh_criterion(
+                    nasa_out["soh_pred"],
+                    nasa_batch["soh_label"],
+                    cycle_age=nasa_batch.get("cycle_idx"),
+                    battery_ids=nasa_batch.get("battery_id"),
+                )
+
+                # Degradation loss from Mendeley batch
+                mend_out = self.model.forward_eis_only(mend_batch["eis"])
+                deg_loss = self.deg_criterion(
+                    lli_pred=mend_out["lli_pred"],
+                    lam_pred=mend_out["lam_pred"],
+                    cl_pred=mend_out["cl_pred"],
+                    lli_target=mend_batch["lli_label"],
+                    lam_target=mend_batch["lam_label"],
+                    cl_target=mend_batch["cl_label"],
+                )
+
+                # Combined loss — single backward pass
+                combined = self.lambda_soh * soh_loss + self.lambda_deg * deg_loss
+                combined.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 self.optimizer.step()
 
+                total_soh_loss += soh_loss.item()
                 total_deg_loss += deg_loss.item()
-                n_mendeley += 1
+                n_steps += 1
 
         return {
-            "soh_loss": total_soh_loss / max(n_nasa, 1),
-            "deg_loss": total_deg_loss / max(n_mendeley, 1),
+            "soh_loss": total_soh_loss / max(n_steps, 1),
+            "deg_loss": total_deg_loss / max(n_steps, 1),
         }
 
     # -----------------------------------------------------------------------
@@ -359,7 +395,7 @@ class MultiTaskTrainer:
                 f"Epoch {epoch:3d}/{self.num_epochs}  "
                 f"soh_train={t_losses['soh_loss']:.4f}  "
                 f"soh_val={v_soh_loss:.4f}  "
-                f"MAE={v_soh_met['mae']:.3f}  RMSE={v_soh_met['rmse']:.3f}  "
+                f"MAE={v_soh_met['mae']*100:.2f}%  RMSE={v_soh_met['rmse']*100:.2f}%  "
                 f"R²={v_soh_met['r2']:.4f}{deg_line}"
             )
 
@@ -379,7 +415,7 @@ class MultiTaskTrainer:
         history["best_val_mae"] = best_val_mae
         logger.info(
             f"Training complete in {elapsed:.0f}s  "
-            f"best_val_MAE={best_val_mae:.3f}"
+            f"best_val_MAE={best_val_mae*100:.2f}%"
         )
 
         # Load best weights
@@ -409,7 +445,7 @@ class MultiTaskTrainer:
         )
         logger.info(
             f"  ✓ Checkpoint saved (epoch {epoch}, "
-            f"MAE={metrics.get('mae', '?'):.3f}) → {path}"
+            f"MAE={metrics.get('mae', 0)*100:.2f}%) -> {path}"
         )
 
     def save_checkpoint(self, path: str, epoch: int = 0, metrics: Dict = None):
@@ -456,26 +492,45 @@ class MultiTaskTrainer:
             for batch in loader:
                 batch = _to_device(batch, self.device)
                 out = self.model.forward_eis_only(batch["eis"])
+                batch_size = out["lli_pred"].view(-1).shape[0]
+
                 lli_p.append(out["lli_pred"].view(-1).cpu().numpy())
                 lam_p.append(out["lam_pred"].view(-1).cpu().numpy())
                 cl_p.append(out["cl_pred"].view(-1).cpu().numpy())
                 lli_t.append(batch["lli_label"].view(-1).cpu().numpy())
                 lam_t.append(batch["lam_label"].view(-1).cpu().numpy())
                 cl_t.append(batch["cl_label"].view(-1).cpu().numpy())
-                cell_ids.extend(
-                    batch["cell_id"]
-                    if isinstance(batch["cell_id"], list)
-                    else [int(batch["cell_id"])] * len(out["lli_pred"])
+
+                # Robust cell_id handling — batch["cell_id"] can be:
+                #   - a list of ints (DataLoader collate default for scalars)
+                #   - a 1-D LongTensor of shape (B,)
+                #   - rarely a 0-D tensor or plain Python int (single sample)
+                raw_cids = batch["cell_id"]
+                if isinstance(raw_cids, torch.Tensor):
+                    cids = raw_cids.view(-1).cpu().tolist()
+                elif isinstance(raw_cids, (list, tuple)):
+                    cids = list(raw_cids)
+                else:
+                    # scalar — replicate for every sample in batch
+                    cids = [int(raw_cids)] * batch_size
+                # Ensure one entry per prediction
+                assert len(cids) == batch_size, (
+                    f"cell_id count ({len(cids)}) != batch_size ({batch_size})"
                 )
+                cell_ids.extend([int(c) for c in cids])
+
                 cycles.append(batch["aging_cycle"].cpu().numpy())
 
+        assert len(cell_ids) == len(np.concatenate(lli_p)), \
+            "cell_ids length mismatch with predictions"
+
         return {
-            "lli_pred":    np.concatenate(lli_p),
-            "lam_pred":    np.concatenate(lam_p),
-            "cl_pred":     np.concatenate(cl_p),
-            "lli_target":  np.concatenate(lli_t),
-            "lam_target":  np.concatenate(lam_t),
-            "cl_target":   np.concatenate(cl_t),
-            "cell_ids":    cell_ids,
+            "lli_pred":     np.concatenate(lli_p),
+            "lam_pred":     np.concatenate(lam_p),
+            "cl_pred":      np.concatenate(cl_p),
+            "lli_target":   np.concatenate(lli_t),
+            "lam_target":   np.concatenate(lam_t),
+            "cl_target":    np.concatenate(cl_t),
+            "cell_ids":     cell_ids,
             "aging_cycles": np.concatenate(cycles),
         }

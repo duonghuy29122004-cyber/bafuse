@@ -57,22 +57,22 @@ class DischargeEncoder(nn.Module):
 
 class EISEncoder(nn.Module):
     """
-    Encode EIS spectrum (impedance measurements) into latent vector via 1-D CNN.
+    Encode EIS spectrum into latent vector via MLP (small feature count) or 1-D CNN.
 
-    Input: Real/imaginary impedance vs frequency  OR scalar impedance features
-    Output: Fixed-size latent representation
+    Input: scalar impedance features (NASA: 3D, Mendeley: 8D) or full spectrum.
+    Output: fixed-size latent representation (latent_dim,).
     """
 
     def __init__(self, num_frequencies: int, hidden_size: int = 128, latent_dim: int = 64):
         """
         Args:
-            num_frequencies: Number of frequency points in EIS (or feature dimension)
-            hidden_size: Hidden layer dimension
-            latent_dim: Output latent dimension
+            num_frequencies: EIS feature dimension (≤8 → MLP, >8 → 1-D CNN).
+            hidden_size: Hidden layer width.
+            latent_dim: Output latent dimension.
         """
         super().__init__()
-
-        self.use_mlp = num_frequencies <= 8  # small feature vector → just MLP
+        self.num_frequencies = num_frequencies
+        self.use_mlp = num_frequencies <= 8
 
         if self.use_mlp:
             self.net = nn.Sequential(
@@ -84,13 +84,13 @@ class EISEncoder(nn.Module):
                 nn.ReLU(),
             )
         else:
-            # 1-D CNN on frequency spectrum
+            # 1-D CNN on full frequency spectrum (B, num_freq, 2)
             self.cnn = nn.Sequential(
                 nn.Conv1d(2, 32, kernel_size=5, padding=2),
                 nn.ReLU(),
                 nn.Conv1d(32, 64, kernel_size=5, padding=2),
                 nn.ReLU(),
-                nn.AdaptiveAvgPool1d(1),   # global average pooling → (B, 64, 1)
+                nn.AdaptiveAvgPool1d(1),
             )
             self.proj = nn.Sequential(
                 nn.Linear(64, latent_dim),
@@ -101,34 +101,40 @@ class EISEncoder(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x: (batch_size, num_frequencies, 2) [real, imag]
-               OR (batch_size, num_features) for scalar case
+            x: (B, num_frequencies) for MLP path,
+               (B, num_freq, 2) for CNN path.
 
         Returns:
-            (batch_size, latent_dim)
+            (B, latent_dim)
+
+        P3-#8 FIX: The old _mlp_fallback() created an nn.Linear inside forward()
+        using lazy init (`if not hasattr(self, '_fallback_proj')`). Any layer
+        created after the optimizer is built is invisible to it and never trained.
+        That dead-code path is removed entirely.
+        - MLP path: handles (B, F) directly; if a 3-D tensor arrives it is
+          flattened to (B, F*2).
+        - CNN path: expects (B, num_freq, 2); raises ValueError if a 2-D tensor
+          arrives (wrong input shape for this config — fail loudly).
         """
         if self.use_mlp:
             if x.dim() == 3:
-                # Flatten (B, F, 2) → (B, F*2)? — adapt by flattening last two dims
                 x = x.reshape(x.size(0), -1)
+            if x.shape[-1] != self.num_frequencies:
+                raise ValueError(
+                    f"EISEncoder(MLP) expects input dim {self.num_frequencies}, "
+                    f"got {x.shape[-1]}. Check EIS feature pipeline."
+                )
             return self.net(x)
         else:
-            # x: (B, num_freq, 2) → permute to (B, 2, num_freq) for Conv1d
-            if x.dim() == 2:
-                # Scalar EIS features, fall back to simple MLP path
-                return self._mlp_fallback(x)
-            x = x.permute(0, 2, 1)  # (B, 2, num_freq)
-            out = self.cnn(x)        # (B, 64, 1)
-            out = out.squeeze(-1)    # (B, 64)
+            if x.dim() != 3:
+                raise ValueError(
+                    f"EISEncoder(CNN) expects 3-D input (B, num_freq, 2), "
+                    f"got shape {tuple(x.shape)}. "
+                    f"For scalar EIS features use num_frequencies <= 8 (MLP mode)."
+                )
+            x = x.permute(0, 2, 1)   # (B, 2, num_freq)
+            out = self.cnn(x).squeeze(-1)
             return self.proj(out)
-
-    def _mlp_fallback(self, x: torch.Tensor) -> torch.Tensor:
-        """Fallback MLP for scalar EIS features."""
-        # Create simple linear projection
-        if not hasattr(self, '_fallback_proj'):
-            self._fallback_proj = nn.Linear(x.size(1), 64).to(x.device)
-        out = torch.relu(self._fallback_proj(x))
-        return out
 
 
 class PhysicsEncoder(nn.Module):
