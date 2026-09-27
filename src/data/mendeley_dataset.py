@@ -333,19 +333,22 @@ def build_mendeley_dataframe(
             continue
 
         # P4-#11: log match rate to detect silent partial-join data loss
-        n_eis  = len(eis_agg)
-        n_circ = len(circ_raw)
-        n_join = len(merged)
-        match_rate = n_join / max(min(n_eis, n_circ), 1)
+        n_eis_cycles  = eis_agg['aging_cycle'].nunique()
+        n_circ_cycles = circ_raw['aging_cycle'].nunique()
+        n_join_cycles = merged['aging_cycle'].nunique()
+        match_rate = n_join_cycles / max(min(n_eis_cycles, n_circ_cycles), 1)
         if match_rate < 0.9:
             logger.warning(
-                f"Cell {cell_id}: inner join matched {n_join}/{min(n_eis,n_circ)} cycles "
+                f"Cell {cell_id}: inner join matched {n_join_cycles}/"
+                f"{min(n_eis_cycles,n_circ_cycles)} aging cycles "
                 f"({match_rate*100:.0f}%) — possible aging_cycle numbering mismatch "
-                f"between EISexp ({n_eis} cycles) and Circuit_parameter ({n_circ} cycles)."
+                f"between EISexp ({n_eis_cycles} cycles) and "
+                f"Circuit_parameter ({n_circ_cycles} cycles)."
             )
         else:
             logger.info(
-                f"Cell {cell_id}: inner join matched {n_join}/{min(n_eis,n_circ)} cycles "
+                f"Cell {cell_id}: inner join matched {n_join_cycles}/"
+                f"{min(n_eis_cycles,n_circ_cycles)} aging cycles "
                 f"({match_rate*100:.0f}%)"
             )
 
