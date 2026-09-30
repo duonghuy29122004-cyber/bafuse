@@ -89,6 +89,17 @@ def main(args):
     training_mode = args.training_mode or cfg.get("training", {}).get("training_mode", "nasa_only")
     logger.info(f"Training mode: {training_mode}")
 
+    # NEW DIRECTION GUARD: Samsung/Mendeley must NOT be used in training.
+    # Raise an explicit error instead of silently violating the protocol.
+    if training_mode in ("staged", "joint"):
+        raise ValueError(
+            f"training_mode='{training_mode}' is no longer permitted under the new "
+            "research direction (2026-09). Samsung/Mendeley data must only be used "
+            "as an EXTERNAL TEST dataset via scripts/evaluate_samsung_external.py. "
+            "Set training_mode='nasa_only' in configs/config_bafuse_v2.yaml or "
+            "pass --training_mode nasa_only."
+        )
+
     t_cfg  = cfg.get("training", {})
     m_cfg  = cfg.get("model",    {})
     proc   = cfg.get("processing", {})

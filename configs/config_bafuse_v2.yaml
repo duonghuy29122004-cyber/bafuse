@@ -94,10 +94,17 @@ training:
   num_workers: 0
   pin_memory:  false
   shuffle:     true
-  # [v2] Training mode: nasa_only | staged | joint
-  training_mode: "staged"
+  # NEW DIRECTION (2026-09): NASA is the ONLY training/validation dataset.
+  # Samsung/Mendeley must ONLY be used as an independent external test dataset.
+  # Do NOT set "staged" or "joint" — those modes use Mendeley in the training
+  # loss, which violates the new protocol.
+  training_mode: "nasa_only"
 
 # -- [v2] Stage-1 Degradation Pre-training --------------------
+# NOTE: Stage-1 degradation pre-training (train_degradation.py) is DEPRECATED
+# under the new research direction. Samsung/Mendeley is now external-test-only.
+# These settings are preserved for backward compatibility but should NOT be used
+# in the primary training workflow.
 degradation_training:
   num_epochs:      50
   lr:              0.001
@@ -170,3 +177,26 @@ output:
 device:        "cpu"
 deterministic: true
 seed:          42
+
+# -- Samsung/Mendeley — External Test Only (NEW DIRECTION 2026-09) -----------
+# Samsung data is used ONLY as an independent external test dataset.
+# It is NEVER used for: training, validation, normalization, hyperparameter
+# tuning, model selection, early stopping, loss computation, or fine-tuning.
+# Purpose: evaluate generalization of a NASA-trained model to a different
+# battery chemistry/protocol.
+samsung_external_eval:
+  enabled:             true
+  processed_dir:       "data/mendeley_processed"
+  # Cell used for external SOH test (default: held-out cell 2)
+  test_cells:          [2]
+  # Normalization: use NASA training statistics ONLY (do not refit on Samsung)
+  use_nasa_norm_stats: true
+  # Output
+  results_dir:         "results/samsung_external_eval"
+  note: >
+    Samsung cells are Samsung INR18650-30Q (2.95 Ah nominal).
+    NASA cells are 18650-type Li-ion (2.0 Ah nominal).
+    Direct SOH comparison requires normalization by respective nominal capacities.
+    Do NOT row-match NASA and Samsung cells.
+    Do NOT interpret Samsung SOH difference as a model failure without
+    accounting for chemistry/protocol differences between datasets.

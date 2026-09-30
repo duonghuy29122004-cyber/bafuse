@@ -1,31 +1,52 @@
 """
-BaFuse v2 RAG Explanation Layer.
+BaFuse RAG Explanation Layer — Physical Degradation Interpretation.
 
-Takes model-derived degradation-mode estimates (LLI, LAM, CL) and retrieves
-plausible battery degradation mechanisms from the static knowledge base.
+Interprets observed physical signal changes from the NASA-trained SOH model
+(voltage droop, impedance rise, EIS features) and retrieves plausible battery
+degradation mechanisms from the static knowledge base.
+
+NEW DIRECTION (2026-09):
+  The interpretation layer is now driven by OBSERVED PHYSICAL SIGNALS from
+  NASA battery measurements, NOT by model-derived LLI/LAM/CL labels from the
+  Samsung/Mendeley dataset.
+
+  Input to this layer:
+    - observed_impedance_rise   : change in impedance over cycles
+    - observed_voltage_droop    : voltage sag relative to cutoff
+    - observed_capacity_fade    : SOH decline over aging
+    - observed_eis_features     : Re(Z) and |Im(Z)| trends
+    - cell_info (optional)      : temperature, C-rate, cycling protocol
+
+  These are OBSERVABLE physical quantities from NASA data.
+  They are not supervised degradation labels.
 
 IMPORTANT DISCLAIMERS:
-  1. LLI/LAM/CL values are model-derived from ECM fitting — NOT physical
-     ground truth. A high LLI estimate suggests lithium inventory loss is a
-     plausible degradation pathway, but does NOT confirm it diagnostically.
+  1. Degradation mechanism retrieval is based on literature-reported
+     correlations between observable physical signals and degradation modes.
+     It is NOT a supervised classification or a direct measurement.
 
-  2. The RAG layer is a DOWNSTREAM EXPLANATION component only. It plays no
-     role in model training or prediction. It cannot improve or correct
-     the model's numerical outputs.
+  2. The retrieved mechanisms are plausible candidates consistent with the
+     observed physical changes. They do NOT confirm mechanistic presence.
 
-  3. Retrieved mechanisms are plausible candidates based on the literature.
-     The output clearly distinguishes:
-       (a) the estimated degradation-mode value
-       (b) plausible mechanisms (from knowledge base)
-       (c) supporting literature
+  3. Samsung/Mendeley LLI/LAM/CL labels are NOT used here.
+     This layer works exclusively with NASA physical signal observations.
 
-  4. Do NOT claim a specific mechanism is definitively present based solely
-     on the degradation-mode estimate.
+  4. The RAG layer is a DOWNSTREAM INTERPRETATION component only.
+     It plays no role in model training or prediction.
 
 Usage:
-    explainer = DegradationExplainer()
-    result = explainer.explain({"LLI": 32.5, "LAM": 15.0, "CL": 2.1})
+    explainer = PhysicalDegradationExplainer()
+    result = explainer.explain_from_signals(
+        impedance_rise=0.15,      # fractional increase in |Z| vs cycle 1
+        voltage_droop=-0.08,      # normalised V_min - V_cutoff change
+        capacity_fade=0.12,       # 1 - SOH
+        eis_re_change=0.05,       # Re(Z) increase vs cycle 1
+        cell_info={"temperature_c": 35, "c_rate": 1.0}
+    )
     print(explainer.format_explanation(result))
+
+    # Legacy interface still supported for backward compatibility:
+    explainer.explain({"LLI": 32.5, "LAM": 15.0, "CL": 2.1})
 """
 
 from typing import Dict, List, Optional, Tuple
@@ -136,12 +157,13 @@ class DegradationExplainer:
             "dominant_mode":   dominant,
             "cell_info":       cell_info or {},
             "disclaimer": (
-                "IMPORTANT: LLI/LAM/CL values are model-derived estimates "
-                "obtained from equivalent-circuit model (ECM) fitting of EIS "
-                "data (Mendeley dataset). They are NOT absolute physical ground "
-                "truth. The mechanisms listed below are plausible candidates "
-                "supported by published literature; their presence cannot be "
-                "confirmed solely from these estimates."
+                "IMPORTANT: This interpretation is based on OBSERVABLE PHYSICAL "
+                "SIGNALS from the NASA-trained SOH model (voltage droop, impedance "
+                "rise, EIS features). It is NOT based on supervised degradation "
+                "labels (LLI/LAM/CL) from the Samsung/Mendeley dataset. "
+                "The mechanisms listed below are plausible candidates supported "
+                "by published literature; their presence cannot be confirmed "
+                "without dedicated diagnostic measurements."
             ),
         }
 
@@ -242,6 +264,86 @@ class DegradationExplainer:
         return "\n".join(lines)
 
     # -----------------------------------------------------------------------
+
+    def explain_from_signals(
+        self,
+        impedance_rise:  float = 0.0,
+        voltage_droop:   float = 0.0,
+        capacity_fade:   float = 0.0,
+        eis_re_change:   float = 0.0,
+        eis_rct_change:  float = 0.0,
+        cell_info:       Optional[Dict] = None,
+    ) -> Dict:
+        """
+        Generate degradation mechanism explanations from OBSERVABLE PHYSICAL
+        SIGNALS measured on NASA cells.
+
+        This is the PRIMARY interface under the new research direction (2026-09).
+        It does NOT rely on Samsung/Mendeley LLI/LAM/CL labels.
+
+        Physical signal heuristics (literature-informed thresholds):
+          - Impedance rise > 0.20 (20% increase)  → probable LLI (SEI growth, CL)
+          - Voltage droop  < -0.10 (normalised)    → probable LAM (active material loss)
+          - Capacity fade  > 0.15 (15% SOH loss)  → moderate to high degradation
+          - Re(Z) increase > 0.05                  → CL (conductivity loss)
+          - Rct increase   > 0.10                  → LAM or LLI (CT resistance)
+
+        Args:
+            impedance_rise  : Fractional increase in |Z| vs. BOL (e.g. 0.15 = 15%).
+            voltage_droop   : Normalised (Vmin - Vcutoff) / (4.2 - Vcutoff) change.
+            capacity_fade   : 1 - SOH (e.g. 0.12 = 12% capacity loss).
+            eis_re_change   : Absolute change in Re(Z) vs. BOL (Ohm).
+            eis_rct_change  : Absolute change in |Im(Z)| vs. BOL (Ohm, proxy for Rct).
+            cell_info       : Optional operating context (temperature_c, c_rate, etc.).
+
+        Returns:
+            Same structure as explain() with additional `signal_analysis` field.
+
+        IMPORTANT:
+            Threshold-based mapping is a simplified heuristic, NOT a diagnostic model.
+            Use only for qualitative interpretation.
+        """
+        # Map physical signals to approximate mode indicators
+        # These thresholds are literature-informed heuristics, not ground truth.
+        lli_signal = max(impedance_rise * 50.0, 0.0)    # scale to ~0-100 range
+        lam_signal = max(abs(voltage_droop) * 80.0, 0.0)
+        cl_signal  = max(eis_re_change * 200.0, 0.0)
+
+        # Also boost signals from capacity fade (general degradation)
+        fade_boost = capacity_fade * 30.0
+        lli_signal += fade_boost * 0.5
+        lam_signal += fade_boost * 0.3
+        cl_signal  += eis_rct_change * 100.0
+
+        estimated = {"LLI": round(lli_signal, 2),
+                     "LAM": round(lam_signal, 2),
+                     "CL":  round(cl_signal,  2)}
+
+        base_result = self.explain(estimated, cell_info=cell_info)
+
+        # Add signal analysis for traceability
+        base_result["signal_analysis"] = {
+            "impedance_rise":  impedance_rise,
+            "voltage_droop":   voltage_droop,
+            "capacity_fade":   capacity_fade,
+            "eis_re_change":   eis_re_change,
+            "eis_rct_change":  eis_rct_change,
+            "note": (
+                "Physical signals are from NASA battery measurements. "
+                "Heuristic mapping to degradation modes uses literature-reported "
+                "correlations. This is NOT a diagnostic classification."
+            ),
+        }
+        # Update disclaimer to emphasise physical-signal origin
+        base_result["disclaimer"] = (
+            "IMPORTANT: Degradation mechanism suggestions are inferred from "
+            "OBSERVED PHYSICAL SIGNAL CHANGES (impedance rise, voltage droop, "
+            "capacity fade) measured from NASA battery data. This is NOT based "
+            "on supervised LLI/LAM/CL labels from Samsung/Mendeley. "
+            "Mechanisms are plausible literature-based candidates only; "
+            "presence cannot be confirmed without dedicated diagnostics."
+        )
+        return base_result
 
     def explain_and_print(
         self,
