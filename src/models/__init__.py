@@ -4,6 +4,7 @@ BaFuse model package.
 Public API:
     BaFuse     — v1 model (original, backward compatible)
     BaFuseV2   — v2 model (adds degradation head + modality masking)
+    TinySOH    — small CNN+MLP baseline
     DegradationHead
     DischargeEncoder, EISEncoder, PhysicsEncoder, PhysicsEncoderCNN
     CrossAttentionFusion, WeightedFusion, ConcatFusion
@@ -19,10 +20,12 @@ from .encoders import (
     PhysicsEncoderCNN,
 )
 from .fusion import CrossAttentionFusion, WeightedFusion, ConcatFusion
+from .tiny_soh import TinySOH
 
 __all__ = [
     "BaFuse",
     "BaFuseV2",
+    "TinySOH",
     "DegradationHead",
     "DischargeEncoder",
     "EISEncoder",

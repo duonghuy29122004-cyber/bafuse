@@ -27,7 +27,8 @@ wheels/
 data/raw/*.mat
 data/processed/*.pkl
 data/processed/*.csv
-data/
+# Only ignore the data/ folder at root, not src/data/
+/data/
 
 # Checkpoints & Results
 checkpoints/

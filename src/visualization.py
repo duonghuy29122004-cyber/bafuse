@@ -75,15 +75,22 @@ def plot_soh_predictions(
     """
     Scatter plot of predicted vs true SOH.
 
+    Input predictions/targets are expected on the [0,1] SOH scale (as
+    produced by evaluate.py / multitask_trainer.predict_soh()).
+    This function converts to percent internally for display (×100).
+
     Args:
-        predictions  : (N,) predicted SOH values.
-        targets      : (N,) ground-truth SOH values.
+        predictions  : (N,) predicted SOH values in [0,1].
+        targets      : (N,) ground-truth SOH values in [0,1].
         battery_ids  : Optional list of battery IDs for colour-coding.
         title        : Plot title.
         out_path     : If given, save to this path.
     """
-    preds   = np.asarray(predictions).ravel()
-    tgts    = np.asarray(targets).ravel()
+    # P5-#3 FIX: convert [0,1] → [0,100] BEFORE computing metrics and plotting.
+    # Callers pass [0,1] scale output from evaluate.py; axes are labelled "%".
+    # Without this conversion mae/rmse appear as 0.023 instead of 2.3%.
+    preds = np.asarray(predictions).ravel() * 100.0
+    tgts  = np.asarray(targets).ravel()     * 100.0
 
     mae  = np.mean(np.abs(preds - tgts))
     rmse = np.sqrt(np.mean((preds - tgts) ** 2))
@@ -138,11 +145,16 @@ def plot_soh_degradation_curve(
 ) -> "plt.Figure":
     """
     Per-battery SOH curve: predicted (dashed) vs true (solid) over cycles.
+
+    Input predictions/targets are expected on the [0,1] SOH scale (as
+    produced by evaluate.py / multitask_trainer.predict_soh()).
+    This function converts to percent internally for display (×100).
     """
     import pandas as pd
 
-    preds  = np.asarray(predictions).ravel()
-    tgts   = np.asarray(targets).ravel()
+    # P5-#3 FIX: convert [0,1] → [0,100] before plotting so Y-axis shows %.
+    preds  = np.asarray(predictions).ravel() * 100.0
+    tgts   = np.asarray(targets).ravel()     * 100.0
     bids   = np.asarray(battery_ids)
     cycles = np.asarray(cycle_indices) if cycle_indices is not None \
              else np.arange(len(preds))
@@ -363,7 +375,17 @@ def plot_degradation_predictions(
     Scatter plots: predicted vs target for LLI, LAM, CL.
 
     NOTE: Targets are model-derived from ECM fitting — not absolute ground truth.
-    This is stated in the subtitle.
+
+    SCALE NOTE (P5-#3 audit): predict_deg() in multitask_trainer.py returns
+    z-scored values (model output vs z-scored labels from MendeleyDataset).
+    Both pred and target here are on the same z-scored scale, so the scatter
+    is internally consistent. However axes are labelled "LLI (%)" etc. which
+    implies original % units. To plot in original units, denormalize with
+    mendeley train stats before calling this function:
+        lli_pred_pct = lli_pred * stats["lli_pct"]["std"] + stats["lli_pct"]["mean"]
+    This is left to the caller to avoid coupling this plot function to a
+    specific dataset's stats. The z-scored plot is still valid for visual
+    correlation analysis. A future enhancement can add a `stats` parameter.
     """
     fig, axes = plt.subplots(1, 3, figsize=(14, 5))
     fig.suptitle(
@@ -503,12 +525,16 @@ def generate_all_plots(
             deg_results["cl_pred"],   deg_results["cl_target"],
             out_path=str(od / "degradation_predictions.png"),
         )
+        # P5-#2 FIX: `np.array([...]) or None` raises ValueError when the
+        # array has > 1 element (ambiguous truth value). Use explicit len check.
+        _cids = deg_results.get("cell_ids", [])
+        cell_ids_arr = np.array(_cids) if len(_cids) > 0 else None
         plot_degradation_trends(
             deg_results["aging_cycles"],
             deg_results["lli_pred"],
             deg_results["lam_pred"],
             deg_results["cl_pred"],
-            cell_ids=np.array(deg_results.get("cell_ids", [])) or None,
+            cell_ids=cell_ids_arr,
             out_path=str(od / "degradation_trends.png"),
         )
-    logger.info(f"All plots saved → {od}")
+    logger.info(f"All plots saved -> {od}")

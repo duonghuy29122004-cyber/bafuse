@@ -158,6 +158,7 @@ def pair_discharge_eis(
             eis_row  = candidates.iloc[0]
             gap      = int(eis_row['cycle_idx'] - d_cycle)
 
+            duration_s = float(d_row['time_end'] - d_row['time_start'])
             paired_list.append({
                 'battery_id':     battery_id,
                 'discharge_cycle': d_cycle,
@@ -171,6 +172,8 @@ def pair_discharge_eis(
                 'current_std':    d_row['current_std'],
                 'temp_mean':      d_row['temp_mean'],
                 'temp_std':       d_row['temp_std'],
+                'duration_s':     duration_s,
+                'num_samples':    d_row['num_samples'],
                 'impedance_ohm':  eis_row['impedance_ohm'],
                 're_ohm':         eis_row['re_ohm'],
                 'rct_ohm':        eis_row['rct_ohm'],
