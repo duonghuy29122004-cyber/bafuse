@@ -1,0 +1,85 @@
+{
+  "audit_date": "2026-09",
+  "checks": [
+    {
+      "id": "L1",
+      "check": "Samsung data not used in model training",
+      "status": "PASS",
+      "evidence": "config_bafuse_v2.yaml training_mode=nasa_only; train_bafuse_v2.py raises ValueError on staged/joint"
+    },
+    {
+      "id": "L2",
+      "check": "Samsung data not used in validation",
+      "status": "PASS",
+      "evidence": "NASA val split uses only NASA batteries; Samsung never passed to MultiTaskTrainer.fit()"
+    },
+    {
+      "id": "L3",
+      "check": "Samsung data not used for early stopping",
+      "status": "PASS",
+      "evidence": "Early stopping driven by NASA val MAE only (multitask_trainer.py)"
+    },
+    {
+      "id": "L4",
+      "check": "Samsung data not used for model selection",
+      "status": "PASS",
+      "evidence": "Best checkpoint saved by NASA val MAE"
+    },
+    {
+      "id": "L5",
+      "check": "Samsung normalization stats not applied to model inputs",
+      "status": "FAIL",
+      "evidence": "evaluate_samsung_external.py loads data/mendeley_processed/mendeley_stats.json (Samsung-derived) and applies it as normalization stats. This violates the protocol.",
+      "fix_required": "Load NASA training stats from data/processed/nasa_train_stats.json instead. Additionally acknowledge EIS scale mismatch."
+    },
+    {
+      "id": "L6",
+      "check": "Samsung SOH/capacity not used as model input feature",
+      "status": "PASS",
+      "evidence": "compute_samsung_soh_labels() is called only after prediction for metric computation"
+    },
+    {
+      "id": "L7",
+      "check": "Samsung LLI/LAM/CL not used as training targets",
+      "status": "PASS",
+      "evidence": "DegradationLoss not used in nasa_only mode; no deg loss in training loop"
+    },
+    {
+      "id": "L8",
+      "check": "No NASA/Samsung row matching",
+      "status": "PASS",
+      "evidence": "No code row-matches NASA batteries to Samsung cells"
+    },
+    {
+      "id": "L9",
+      "check": "Missing discharge/physics not artificially filled with zeros passed to full model",
+      "status": "FAIL",
+      "evidence": "evaluate_with_benchmark_model() creates disc_zero=zeros(B,100,3) and phys_zero=zeros(B,4) and passes them to untrained-with-zeros full models. Models were NOT trained with zero discharge/physics — this produces out-of-distribution inference without scientific justification.",
+      "fix_required": "Remove full-model zero-padding evaluation. Replace with clearly labeled EIS-only evaluation using only the EIS encoder branch."
+    },
+    {
+      "id": "L10",
+      "check": "EIS evaluation labeled correctly (not as full multimodal)",
+      "status": "FAIL",
+      "evidence": "evaluate_samsung_external.py header says 'EIS-only path' but still calls the full model with zeroed modalities, which is different from a true EIS-only path.",
+      "fix_required": "Use only the EIS encoder's output; do not pass through fusion layer with artificial zero inputs."
+    },
+    {
+      "id": "L11",
+      "check": "NASA training stats persisted to disk for use in external evaluation",
+      "status": "FAIL",
+      "evidence": "NASA training stats (BaFuseDataset.stats) are computed in memory but not saved to disk. evaluate_samsung_external.py cannot access them.",
+      "fix_required": "Save stats to data/processed/nasa_train_stats.json during training."
+    }
+  ],
+  "summary": {
+    "passed": 7,
+    "failed": 4,
+    "critical_failures": [
+      "L5: Wrong normalization stats used (Samsung stats, not NASA stats)",
+      "L9: Zero-padding missing modalities into untrained full model",
+      "L10: Results mislabeled as EIS-only but use full model architecture",
+      "L11: NASA training stats not persisted for external eval"
+    ]
+  }
+}

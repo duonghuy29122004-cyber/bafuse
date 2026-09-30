@@ -139,6 +139,7 @@ def main(args):
         discharge_data_df=disc_df,
         batch_size=t_cfg.get("batch_size", 32),
         num_workers=0,
+        save_stats_path=str(proc_dir / "nasa_train_stats.json"),
     )
 
     sample  = next(iter(nasa_train))

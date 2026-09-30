@@ -236,6 +236,17 @@ class BaFuseDataset(Dataset):
             "A": _FALLBACK_AGING_A, "b": _FALLBACK_AGING_B, "N_ref": _FALLBACK_AGING_N_REF
         }
 
+        # Performance: pre-build a dict keyed by (battery_id, cycle_idx) for O(1) lookup
+        # instead of O(n) boolean filtering in __getitem__.
+        if self.discharge_data_df is not None and not self.discharge_data_df.empty:
+            self._disc_index: dict = {}
+            for (bid, cyc), grp in self.discharge_data_df.groupby(
+                ["battery_id", "cycle_idx"], sort=False
+            ):
+                self._disc_index[(bid, cyc)] = grp
+        else:
+            self._disc_index = {}
+
         if self.normalize:
             if external_stats is not None:
                 self.stats = external_stats
@@ -317,11 +328,8 @@ class BaFuseDataset(Dataset):
         ], dtype=np.float32)
 
         if self.discharge_data_df is not None:
-            ts_df = self.discharge_data_df[
-                (self.discharge_data_df['battery_id'] == battery_id) &
-                (self.discharge_data_df['cycle_idx']  == discharge_cycle)
-            ]
-            if not ts_df.empty:
+            ts_df = self._disc_index.get((battery_id, discharge_cycle))
+            if ts_df is not None and len(ts_df) > 0:
                 ts_raw = ts_df[['voltage_v', 'current_a', 'temperature_c']].values
 
                 # P2-#3: z-score each channel using train-set stats BEFORE
@@ -348,12 +356,25 @@ class BaFuseDataset(Dataset):
 
         # ── EIS ────────────────────────────────────────────────────────────
         # P2-#4: normalise all three EIS features. re_ohm / rct_ohm use their
-        # own stats ('re', 'rct') computed at train time; missing values → 0.0
-        # (the mean before normalisation, so NaN→0 after z-score is correct).
+        # own stats ('re', 'rct') computed at train time.
+        # P5-#1 FIX: when a value is missing (NaN/None), impute with the
+        # TRAINING MEAN (not literal 0.0) so that after z-score the result
+        # is exactly 0.0 (neutral — equal to the mean of the distribution).
+        # Imputing with raw 0.0 and then z-scoring gives (0 - mean)/std which
+        # is NOT 0 unless mean happens to be 0, introducing a systematic bias.
         def _eis_val(col: str, stat_key: str) -> float:
             raw = row.get(col, None)
-            val = float(raw) if (raw is not None and pd.notna(raw)) else 0.0
-            return self._normalize(val, stat_key) if self.normalize else val
+            if raw is not None and pd.notna(raw):
+                val = float(raw)
+                return self._normalize(val, stat_key) if self.normalize else val
+            # Missing: impute with train mean so z-score result = 0.0 (neutral).
+            # When normalize=False return the actual mean (not 0.0), because
+            # there is no z-score step to "centre" it.
+            if self.normalize:
+                return 0.0   # (mean - mean) / std == 0.0 by definition
+            # normalize=False: stats may not exist; safe fallback is 0.0
+            stats = getattr(self, "stats", {})
+            return float(stats.get(stat_key, {}).get("mean", 0.0))
 
         eis_features = np.array([
             self._normalize(row['impedance_ohm'], 'impedance'),
@@ -410,12 +431,18 @@ def create_dataloaders(
     batch_size:  int  = 32,
     num_workers: int  = 0,
     pin_memory:  bool = False,
+    save_stats_path: Optional[str] = None,   # NEW: persist NASA train stats to disk
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """
     Create train/val/test DataLoaders.
 
     BUG 2 FIX: val and test datasets receive train_dataset.stats via
     external_stats so all splits are normalised with the same mean/std.
+
+    Args:
+        save_stats_path : If provided, save training normalization stats to this
+                          JSON file so external evaluation scripts can load them.
+                          Example: "data/processed/nasa_train_stats.json"
     """
     # Train: compute stats + fit aging prior from training data
     train_dataset = BaFuseDataset(
@@ -427,6 +454,15 @@ def create_dataloaders(
     )
     # P3: fit aging prior on train population and propagate to val/test
     aging_params = fit_aging_prior(train_df)
+
+    # Optionally persist NASA training stats so external evaluation scripts
+    # can load them without re-fitting on any test data.
+    if save_stats_path is not None:
+        import json as _json
+        Path(save_stats_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(save_stats_path, "w") as _f:
+            _json.dump(train_dataset.stats, _f, indent=2)
+        logger.info(f"NASA train normalization stats saved -> {save_stats_path}")
 
     # Val / Test: reuse train stats + aging prior — BUG 2 + P3 fix
     val_dataset = BaFuseDataset(

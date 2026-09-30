@@ -102,6 +102,7 @@ def main(args):
         discharge_data_df=discharge_df,
         batch_size=args.batch_size,
         num_workers=0,
+        save_stats_path=str(Path(args.output_dir) / "nasa_train_stats.json"),
     )
 
     # Inspect a sample to detect actual feature shapes
