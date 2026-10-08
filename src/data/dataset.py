@@ -459,7 +459,8 @@ def create_dataloaders(
     # can load them without re-fitting on any test data.
     if save_stats_path is not None:
         import json as _json
-        Path(save_stats_path).parent.mkdir(parents=True, exist_ok=True)
+        from pathlib import Path as _Path
+        _Path(save_stats_path).parent.mkdir(parents=True, exist_ok=True)
         with open(save_stats_path, "w") as _f:
             _json.dump(train_dataset.stats, _f, indent=2)
         logger.info(f"NASA train normalization stats saved -> {save_stats_path}")
